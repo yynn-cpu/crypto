@@ -1,0 +1,112 @@
+# -*- coding: utf-8 -*-
+"""
+📱 Pydroid｜Binance 实盘信号扫描器
+逻辑：BIG_GREEN_THEN_RED_SHORT
+仅控制台输出
+"""
+
+import requests
+import pandas as pd
+import time
+from datetime import datetime
+
+# ================== 参数 ==================
+BASE_URL = "https://fapi.binance.com"
+INTERVAL = "1d"
+KLINE_LIMIT = 3
+
+TP = 0.02
+INVEST = 20
+LEVERAGE = 20
+
+BLACKLIST = ["TRXUSDT"]
+
+# ================== 工具函数 ==================
+def candle_down(c):
+    return c["close"] < c["open"]
+
+def get_symbols():
+    r = requests.get(
+        f"{BASE_URL}/fapi/v1/exchangeInfo",
+        timeout=10
+    ).json()
+
+    return [
+        s["symbol"]
+        for s in r["symbols"]
+        if s["quoteAsset"] == "USDT"
+        and s["contractType"] == "PERPETUAL"
+        and s["status"] == "TRADING"
+    ]
+
+def fetch_klines(symbol):
+    r = requests.get(
+        f"{BASE_URL}/fapi/v1/klines",
+        params={
+            "symbol": symbol,
+            "interval": INTERVAL,
+            "limit": KLINE_LIMIT
+        },
+        timeout=10
+    ).json()
+
+    if not isinstance(r, list) or len(r) < 2:
+        return None
+
+    df = pd.DataFrame(r, columns=[
+        "t","open","high","low","close","v",
+        "ct","qv","n","tb","tq","i"
+    ])
+    df[["open", "close"]] = df[["open", "close"]].astype(float)
+    return df
+
+# ================== 触发逻辑（严格按你给的） ==================
+def trigger_BIG_GREEN_THEN_RED_SHORT(df_s, idx):
+    if idx < 1:
+        return False
+    prev = df_s.iloc[idx - 1]
+    last = df_s.iloc[idx]
+    return (prev["close"] > prev["open"] * 1.07) and candle_down(last)
+
+# ================== 扫描启动 ==================
+print("=" * 80)
+print("🚨 BIG_GREEN_THEN_RED_SHORT｜实盘扫描启动")
+print("时间：", datetime.now())
+print("=" * 80)
+
+symbols = get_symbols()
+signal_count = 0
+
+for symbol in symbols:
+    if symbol in BLACKLIST:
+        continue
+
+    try:
+        df = fetch_klines(symbol)
+        if df is None:
+            continue
+
+        idx = len(df) - 1
+        if not trigger_BIG_GREEN_THEN_RED_SHORT(df, idx):
+            continue
+
+        entry = df.iloc[idx]["open"]
+        tp_price = round(entry * (1 - TP), 6)
+        profit_u = round(INVEST * LEVERAGE * TP, 2)
+
+        print(f"\n🔴 {symbol}")
+        print(f"   前一日大阳（+7%） + 今日阴线")
+        print(f"   入场价：{entry}")
+        print(f"   止盈价：{tp_price}")
+        print(f"   仓位：{INVEST}U × {LEVERAGE}x ｜≈ +{profit_u}U")
+
+        signal_count += 1
+        time.sleep(0.3)
+
+    except Exception as e:
+        print(f"⚠️ {symbol} 出错：{e}")
+        continue
+
+print("\n" + "=" * 80)
+print(f"✅ 扫描完成 ｜ 本轮信号数：{signal_count}")
+print("=" * 80)
