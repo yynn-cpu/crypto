@@ -1,0 +1,135 @@
+# -*- coding: utf-8 -*-
+"""
+逻辑2 BIG_GREEN_THEN_RED_SHORT 阈值敏感性回测
+数据源：all_usdt_perp_1d_20260101_1005.csv
+固定止盈2%，20USDT×20杠杆
+"""
+
+import pandas as pd
+import os
+from tqdm import tqdm  # 控制台进度条
+
+# ================= 参数 =================
+DATA_FILE = r"C:\Users\JZDD\Desktop\all_usdt_perp_1d_20260101_1005.csv"
+OUTPUT_DIR = r"C:\Users\JZDD\Desktop\backtest_logic2_threshold"
+INVEST = 20
+LEVERAGE = 20
+TAKE_PROFIT = 2  # 止盈2%
+THRESHOLDS = [1.05, 1.06, 1.07, 1.08, 1.09, 1.10]  # 前一天大阳反包幅度阈值
+
+BLACKLIST = {
+    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","DOGEUSDT",
+    "ADAUSDT","AVAXUSDT","LTCUSDT","BCHUSDT","TONUSDT"
+}
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ================= 读取数据 =================
+df = pd.read_csv(DATA_FILE)
+
+# 时间字段兼容
+if 'date' in df.columns:
+    df['date'] = pd.to_datetime(df['date'])
+elif 'open_time' in df.columns:
+    df['date'] = pd.to_datetime(df['open_time'], unit='ms')
+else:
+    raise ValueError("找不到时间字段 date / open_time")
+
+df = df.sort_values(['symbol', 'date']).reset_index(drop=True)
+
+# ================= 判断大阴线 =================
+def candle_down(row):
+    return row['close'] < row['open']
+
+# ================= 回测逻辑 =================
+def backtest_symbol(df_s, threshold, tp):
+    trades = []
+    holding = False
+    i = 1  # 因为逻辑2只需要前一天数据
+
+    while i < len(df_s):
+        if holding:
+            i += 1
+            continue
+
+        prev = df_s.iloc[i-1]
+        last = df_s.iloc[i]
+
+        if (prev['close'] > prev['open'] * threshold) and candle_down(last):
+            entry_price = last['open']
+            entry_date = last['date']
+            tp_price = entry_price * (1 - tp / 100)
+            max_dd = 0
+            held_days = 0
+            exit_price = None
+            exit_date = None
+
+            # 持仓直到触及止盈
+            for j in range(i, len(df_s)):
+                high = df_s.iloc[j]['high']
+                low = df_s.iloc[j]['low']
+                held_days += 1
+                dd = (high - entry_price) / entry_price * LEVERAGE * INVEST
+                max_dd = max(max_dd, dd)
+                if low <= tp_price:
+                    exit_price = tp_price
+                    exit_date = df_s.iloc[j]['date']
+                    i = j + 1
+                    break
+
+            if exit_price is None:
+                exit_price = df_s.iloc[-1]['close']
+                exit_date = df_s.iloc[-1]['date']
+                i = len(df_s)
+
+            profit = (entry_price - exit_price) / entry_price * LEVERAGE * INVEST
+            trades.append({
+                "symbol": df_s.iloc[i-1]['symbol'],
+                "entry_date": entry_date,
+                "entry_price": entry_price,
+                "exit_date": exit_date,
+                "exit_price": exit_price,
+                "profit": profit,
+                "held_days": held_days,
+                "max_drawdown": max_dd,
+                "threshold": threshold,
+                "invest": INVEST,
+                "leverage": LEVERAGE
+            })
+        else:
+            i += 1
+
+    return trades
+
+# ================= 主回测 =================
+symbols = [s for s in df['symbol'].unique() if s not in BLACKLIST]
+
+for threshold in THRESHOLDS:
+    all_trades = []
+    print(f"\n=== 回测阈值: {threshold} ===")
+    for sym in tqdm(symbols, desc="回测进度"):
+        df_s = df[df['symbol'] == sym].reset_index(drop=True)
+        if len(df_s) < 2:
+            continue
+        all_trades.extend(backtest_symbol(df_s, threshold, TAKE_PROFIT))
+
+    result = pd.DataFrame(all_trades)
+    if result.empty:
+        print("未触发任何信号")
+        continue
+
+    wins = result[result['profit'] > 0]
+    losses = result[result['profit'] <= 0]
+
+    print(f"触发次数: {len(result)}")
+    print(f"盈利次数: {len(wins)} | 亏损次数: {len(losses)} | 胜率: {len(wins)/len(result)*100:.2f}%")
+    print(f"总盈利: {wins['profit'].sum():.2f} USDT")
+    print(f"总亏损: {losses['profit'].sum():.2f} USDT")
+    print(f"净收益: {result['profit'].sum():.2f} USDT")
+    print(f"平均抗单天数: {result['held_days'].mean():.2f}")
+    print(f"最大单笔浮亏: {result['max_drawdown'].max():.2f} USDT")
+    print("="*60)
+
+    result.to_csv(os.path.join(OUTPUT_DIR, f"logic2_threshold_{threshold}.csv"), index=False)
+
+print("\n所有阈值回测完成，结果已保存至:", OUTPUT_DIR)
