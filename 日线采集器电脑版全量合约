@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Binance USDT 永续合约
-全量历史 1D K 线采集（超稳定版｜单表）
+全量历史 1D K 线采集（回测级｜最完整版本）
 """
 
 import requests
@@ -12,14 +12,14 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 BASE_URL = "https://fapi.binance.com"
-LIMIT = 500          # 关键：不要 1000
-SLEEP = 0.15         # 慢一点，稳
+LIMIT = 500
+SLEEP = 0.15
 TIMEOUT = 20
 RETRIES = 5
 
 OUT_FILE = f"all_usdt_perp_1d_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
 
-# ================= 创建稳定 Session =================
+# ================= 稳定 Session =================
 def create_session():
     session = requests.Session()
     retry = Retry(
@@ -30,21 +30,26 @@ def create_session():
     )
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("https://", adapter)
-    session.mount("http://", adapter)
     return session
 
 session = create_session()
 
-# ================= 获取 USDT 永续 =================
-def get_usdt_symbols():
+# ================= 获取所有 USDT 永续（不限制状态） =================
+def get_all_usdt_perp_symbols():
     r = session.get(f"{BASE_URL}/fapi/v1/exchangeInfo", timeout=TIMEOUT)
     data = r.json()
-    return [
-        s["symbol"] for s in data["symbols"]
-        if s["quoteAsset"] == "USDT"
-        and s["status"] == "TRADING"
-        and s["contractType"] == "PERPETUAL"
-    ]
+
+    symbols = []
+    for s in data.get("symbols", []):
+        if (
+            s.get("quoteAsset") == "USDT"
+            and s.get("contractType") == "PERPETUAL"
+        ):
+            symbols.append(s["symbol"])
+
+    # 去重 + 排序，防止币安偶发重复
+    symbols = sorted(list(set(symbols)))
+    return symbols
 
 # ================= 拉取单合约全历史 =================
 def fetch_all_1d(symbol):
@@ -61,13 +66,9 @@ def fetch_all_1d(symbol):
         if end_time:
             params["endTime"] = end_time
 
-        r = session.get(
-            f"{BASE_URL}/fapi/v1/klines",
-            params=params,
-            timeout=TIMEOUT
-        )
-
+        r = session.get(f"{BASE_URL}/fapi/v1/klines", params=params, timeout=TIMEOUT)
         data = r.json()
+
         if not isinstance(data, list) or len(data) == 0:
             break
 
@@ -89,6 +90,7 @@ def fetch_all_1d(symbol):
         "time","open","high","low","close","volume",
         "_","_","_","_","_","_"
     ])
+
     df = df[["time","open","high","low","close","volume"]].astype(float)
     df["date"] = pd.to_datetime(df["time"], unit="ms")
     df["symbol"] = symbol
@@ -96,30 +98,27 @@ def fetch_all_1d(symbol):
     return df[["symbol","date","open","high","low","close","volume"]]
 
 # ================= 主流程 =================
-symbols = get_usdt_symbols()
+symbols = get_all_usdt_perp_symbols()
 total = len(symbols)
 
-print(f"🔍 共发现 {total} 个 USDT 永续合约，开始抓取日线数据\n")
+print(f"🔍 共发现 {total} 个 USDT 永续合约（回测全量）\n")
 
 all_data = []
-success = 0
-partial = 0
-fail = 0
+success = fail = 0
 
 for idx, symbol in enumerate(symbols, 1):
     try:
-        print(f"[{idx}/{total}] 抓取 {symbol} ...")
+        print(f"[{idx}/{total}] 抓取 {symbol}")
         df = fetch_all_1d(symbol)
 
         if df is None or df.empty:
-            raise Exception("无数据")
+            raise Exception("无历史K线")
 
         all_data.append(df)
-        print(f"    ✅ 完成 {symbol}，共 {len(df)} 根")
         success += 1
 
     except Exception as e:
-        print(f"    ⚠️ {symbol} 抓取异常，跳过（{e}）")
+        print(f"    ⚠️ {symbol} 失败：{e}")
         fail += 1
 
     time.sleep(SLEEP)
@@ -131,6 +130,6 @@ final_df.to_csv(OUT_FILE, index=False, encoding="utf-8-sig")
 
 print("\n==================== 完成 ====================")
 print(f"✅ 成功：{success}")
-print(f"⚠️ 失败跳过：{fail}")
-print(f"📁 输出文件：{OUT_FILE}")
-print(f"📊 总行数：{len(final_df)}")
+print(f"⚠️ 失败：{fail}")
+print(f"📁 文件：{OUT_FILE}")
+print(f"📊 总K线：{len(final_df)}")
