@@ -1,0 +1,136 @@
+# -*- coding: utf-8 -*-
+"""
+Binance USDT 永续合约
+全量历史 1D K 线采集（超稳定版｜单表）
+"""
+
+import requests
+import pandas as pd
+import time
+from datetime import datetime
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+BASE_URL = "https://fapi.binance.com"
+LIMIT = 500          # 关键：不要 1000
+SLEEP = 0.15         # 慢一点，稳
+TIMEOUT = 20
+RETRIES = 5
+
+OUT_FILE = f"all_usdt_perp_1d_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+
+# ================= 创建稳定 Session =================
+def create_session():
+    session = requests.Session()
+    retry = Retry(
+        total=RETRIES,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+session = create_session()
+
+# ================= 获取 USDT 永续 =================
+def get_usdt_symbols():
+    r = session.get(f"{BASE_URL}/fapi/v1/exchangeInfo", timeout=TIMEOUT)
+    data = r.json()
+    return [
+        s["symbol"] for s in data["symbols"]
+        if s["quoteAsset"] == "USDT"
+        and s["status"] == "TRADING"
+        and s["contractType"] == "PERPETUAL"
+    ]
+
+# ================= 拉取单合约全历史 =================
+def fetch_all_1d(symbol):
+    all_rows = []
+    end_time = None
+    batch = 0
+
+    while True:
+        params = {
+            "symbol": symbol,
+            "interval": "1d",
+            "limit": LIMIT
+        }
+        if end_time:
+            params["endTime"] = end_time
+
+        r = session.get(
+            f"{BASE_URL}/fapi/v1/klines",
+            params=params,
+            timeout=TIMEOUT
+        )
+
+        data = r.json()
+        if not isinstance(data, list) or len(data) == 0:
+            break
+
+        all_rows = data + all_rows
+        end_time = data[0][0] - 1
+        batch += 1
+
+        print(f"    ↳ {symbol} 第 {batch} 批，累计 {len(all_rows)} 根")
+
+        if len(data) < LIMIT:
+            break
+
+        time.sleep(SLEEP)
+
+    if not all_rows:
+        return None
+
+    df = pd.DataFrame(all_rows, columns=[
+        "time","open","high","low","close","volume",
+        "_","_","_","_","_","_"
+    ])
+    df = df[["time","open","high","low","close","volume"]].astype(float)
+    df["date"] = pd.to_datetime(df["time"], unit="ms")
+    df["symbol"] = symbol
+
+    return df[["symbol","date","open","high","low","close","volume"]]
+
+# ================= 主流程 =================
+symbols = get_usdt_symbols()
+total = len(symbols)
+
+print(f"🔍 共发现 {total} 个 USDT 永续合约，开始抓取日线数据\n")
+
+all_data = []
+success = 0
+partial = 0
+fail = 0
+
+for idx, symbol in enumerate(symbols, 1):
+    try:
+        print(f"[{idx}/{total}] 抓取 {symbol} ...")
+        df = fetch_all_1d(symbol)
+
+        if df is None or df.empty:
+            raise Exception("无数据")
+
+        all_data.append(df)
+        print(f"    ✅ 完成 {symbol}，共 {len(df)} 根")
+        success += 1
+
+    except Exception as e:
+        print(f"    ⚠️ {symbol} 抓取异常，跳过（{e}）")
+        fail += 1
+
+    time.sleep(SLEEP)
+
+# ================= 保存 =================
+final_df = pd.concat(all_data, ignore_index=True)
+final_df.sort_values(["symbol", "date"], inplace=True)
+final_df.to_csv(OUT_FILE, index=False, encoding="utf-8-sig")
+
+print("\n==================== 完成 ====================")
+print(f"✅ 成功：{success}")
+print(f"⚠️ 失败跳过：{fail}")
+print(f"📁 输出文件：{OUT_FILE}")
+print(f"📊 总行数：{len(final_df)}")
