@@ -1,0 +1,125 @@
+# -*- coding: utf-8 -*-
+"""
+📊 本地 CSV 多阈值 BIG_GREEN_THEN_RED_SHORT 回测（输出 CSV）
+逻辑：
+- 前一天大阳超过阈值
+- 当天收阴
+- 第二天收阴 -> 第二天开空
+- 固定 2% 止盈
+- 阈值：1.05, 1.12
+- 输出 CSV（详细交易记录）
+"""
+
+import pandas as pd
+from tqdm import tqdm
+import numpy as np
+
+# ================= 参数 =================
+CSV_FILE = r"C:\Users\JZDD\Desktop\all_usdt_perp_1d_20260101_1625.csv"
+INVEST = 20
+LEVERAGE = 20
+TP = 0.02  # 止盈比例
+THRESHOLDS = [1.05, 1.12]  # 只回测这两个阈值
+OUTPUT_CSV = r"C:\Users\JZDD\Desktop\big_green_then_red_trades.csv"
+
+# ================= 读取数据 =================
+df = pd.read_csv(CSV_FILE)
+df[["open","high","low","close"]] = df[["open","high","low","close"]].astype(float)
+df["date"] = pd.to_datetime(df["date"])
+df = df.sort_values(["symbol","date"]).reset_index(drop=True)
+
+# ================= 工具函数 =================
+def candle_down(c): return c['close'] < c['open']
+def big_green(c, ratio): return c['close'] > c['open'] * ratio
+
+# ================= 回测函数 =================
+def backtest_symbol(df_s, ratio):
+    trades = []
+    n = len(df_s)
+    for i in range(1, n-2):  # 最后一天不能开仓
+        prev = df_s.iloc[i-1]      # 前一天
+        curr = df_s.iloc[i]        # 当天
+        next_candle = df_s.iloc[i+1] # 第二天（开仓日）
+
+        # 严格逻辑：前一天大阳 + 当天收阴 + 第二天收阴
+        if big_green(prev, ratio) and candle_down(curr) and candle_down(next_candle):
+            entry_price = next_candle["open"]
+            entry_date = next_candle["date"]
+            tp_price = entry_price * (1 - TP)
+
+            # 持仓到止盈或最后一根 K
+            exit_price = entry_price
+            exit_date = entry_date
+            peak_loss = 0
+            held_days = 0
+            for j in range(next_candle.name, n):
+                high = df_s.iloc[j]["high"]
+                low = df_s.iloc[j]["low"]
+                # 空单止盈
+                if low <= tp_price:
+                    exit_price = tp_price
+                    exit_date = df_s.iloc[j]["date"]
+                    held_days = j - next_candle.name + 1
+                    break
+                # 更新浮亏
+                peak_loss = max(peak_loss, (high - entry_price)/entry_price*INVEST*LEVERAGE)
+            else:
+                exit_price = df_s.iloc[-1]["close"]
+                exit_date = df_s.iloc[-1]["date"]
+                held_days = df_s.iloc[-1].name - next_candle.name + 1
+
+            profit = (entry_price - exit_price)/entry_price * INVEST * LEVERAGE
+
+            trades.append({
+                "symbol": df_s.iloc[0]["symbol"],
+                "threshold": round(ratio,2),
+                "entry_date": entry_date,
+                "entry_price": entry_price,
+                "exit_date": exit_date,
+                "exit_price": exit_price,
+                "held_days": held_days,
+                "profit": round(profit,2),
+                "max_drawdown": round(peak_loss,2)
+            })
+    return trades
+
+# ================= 主程序 =================
+symbols = df["symbol"].unique()
+all_trades_final = []
+
+for ratio in THRESHOLDS:
+    all_trades = []
+    print("\n" + "="*80)
+    print(f"📊 开始回测 阈值 {ratio:.2f}")
+
+    for sym in tqdm(symbols, desc=f"回测进度 {ratio:.2f}"):
+        df_s = df[df["symbol"]==sym].reset_index(drop=True)
+        trades = backtest_symbol(df_s, ratio)
+        all_trades.extend(trades)
+
+    if all_trades:
+        out_df = pd.DataFrame(all_trades)
+        all_trades_final.append(out_df)
+
+        triggers = len(out_df)
+        wins = len(out_df[out_df["profit"]>0])
+        losses = triggers - wins
+        winrate = wins/triggers*100 if triggers>0 else 0
+        max_held = out_df["held_days"].max()
+        max_dd = out_df["max_drawdown"].max()
+        total_profit = out_df["profit"].sum()
+
+        print(f"\n📊 阈值 {ratio:.2f} 风险画像")
+        print(f"触发次数: {triggers}")
+        print(f"盈利次数: {wins} | 亏损次数: {losses} | 胜率: {winrate:.2f}%")
+        print(f"最长持仓天数: {max_held} 天")
+        print(f"最大浮亏: {max_dd:.2f} USDT")
+        print(f"累计净收益: {total_profit:.2f} USDT")
+    else:
+        print(f"⚠ 阈值 {ratio:.2f} 没有触发任何信号")
+
+# ================= 输出 CSV =================
+if all_trades_final:
+    final_df = pd.concat(all_trades_final, ignore_index=True)
+    final_df.to_csv(OUTPUT_CSV, index=False)
+    print(f"\n✅ 详细交易记录已保存到 {OUTPUT_CSV}")
