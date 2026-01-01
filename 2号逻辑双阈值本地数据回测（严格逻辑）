@@ -1,20 +1,20 @@
 # -*- coding: utf-8 -*-
 """
 📊 本地 CSV 双阈值 BIG_GREEN_THEN_RED_SHORT 回测（固定 TP 2%）
-逻辑：
+逻辑修正：
 - 前一天大阳超过阈值
-- 当天收阴 -> 第二天开空
-- 止盈固定 2%
-- 不设止损，持仓到最后一根 K 或触及止盈
+- 当天收阴
+- 第二天收阴 -> 第二天开空
+- 持仓到止盈或最后一根 K 线
 - 双阈值 1.07 / 1.08
-- 输出交易记录 CSV + 控制台风险画像
 """
 
 import pandas as pd
+from tqdm import tqdm
 
 # ================= 参数 =================
 CSV_FILE = r"C:\Users\JZDD\Desktop\all_usdt_perp_1d_20260101_1625.csv"
-OUTPUT_CSV = r"C:\Users\JZDD\Desktop\big_green_red_backtest_tp2.csv"
+OUTPUT_CSV = r"C:\Users\JZDD\Desktop\big_green_red_backtest_tp2_strict.csv"
 THRESHOLDS = [1.07, 1.08]
 INVEST = 20
 LEVERAGE = 20
@@ -34,39 +34,37 @@ def big_green(c, ratio): return c['close'] > c['open'] * ratio
 def backtest_symbol(df_s, ratio):
     trades = []
     n = len(df_s)
-    for i in range(1, n-1):  # 从第二行开始
-        prev = df_s.iloc[i-1]
-        curr = df_s.iloc[i]
-        next_candle = df_s.iloc[i+1]
-        if big_green(prev, ratio) and candle_down(curr):
+    for i in range(1, n-2):  # 最后一天不能开仓，所以减2
+        prev = df_s.iloc[i-1]      # 前一天
+        curr = df_s.iloc[i]        # 当天
+        next_candle = df_s.iloc[i+1] # 第二天（开仓日）
+
+        # 严格逻辑：前一天大阳 + 当天收阴 + 第二天收阴
+        if big_green(prev, ratio) and candle_down(curr) and candle_down(next_candle):
             entry_price = next_candle["open"]
             entry_date = next_candle["date"]
-
-            # 止盈价格（空单）
             tp_price = entry_price * (1 - TP)
 
-            # 持仓到触及止盈或者最后一根K线
-            exit_price = entry_price  # 初始
+            # 持仓到止盈或最后一根 K
+            exit_price = entry_price
             exit_date = entry_date
             peak_loss = 0
             for j in range(next_candle.name, n):
                 high = df_s.iloc[j]["high"]
                 low = df_s.iloc[j]["low"]
-                # 空单触及止盈
+                # 空单止盈
                 if low <= tp_price:
                     exit_price = tp_price
                     exit_date = df_s.iloc[j]["date"]
                     held_days = j - next_candle.name + 1
                     break
-                # 更新浮亏（空单高点）
+                # 更新浮亏
                 peak_loss = max(peak_loss, (high - entry_price)/entry_price*INVEST*LEVERAGE)
             else:
-                # 没到止盈就持仓到最后一根
                 exit_price = df_s.iloc[-1]["close"]
                 exit_date = df_s.iloc[-1]["date"]
                 held_days = df_s.iloc[-1].name - next_candle.name + 1
 
-            # 计算盈利（空单）
             profit = (entry_price - exit_price)/entry_price * INVEST * LEVERAGE
 
             trades.append({
@@ -87,7 +85,8 @@ def backtest_symbol(df_s, ratio):
 all_trades = []
 symbols = df["symbol"].unique()
 
-for sym in symbols:
+print("\n📊 开始回测，双阈值:", THRESHOLDS)
+for sym in tqdm(symbols, desc="回测进度"):
     df_s = df[df["symbol"]==sym].reset_index(drop=True)
     for ratio in THRESHOLDS:
         trades = backtest_symbol(df_s, ratio)
@@ -108,9 +107,12 @@ if all_trades:
         winrate = wins/triggers*100 if triggers>0 else 0
         max_held = df_r["held_days"].max()
         max_dd = df_r["max_drawdown"].max()
+        total_profit = df_r["profit"].sum()
+
         print("\n" + "="*60)
         print(f"📊 阈值 {ratio} 风险画像")
         print(f"触发次数: {triggers}")
         print(f"盈利次数: {wins} | 亏损次数: {losses} | 胜率: {winrate:.2f}%")
         print(f"最长持仓天数: {max_held} 天")
         print(f"最大浮亏: {max_dd} USDT")
+        print(f"累计净收益: {total_profit:.2f} USDT")
