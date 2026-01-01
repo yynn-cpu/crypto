@@ -1,0 +1,186 @@
+import pandas as pd
+import requests
+from datetime import datetime
+from tqdm import tqdm
+import time
+
+# ================== 参数 ==================
+BASE_URL = "https://fapi.binance.com"
+INVEST = 20
+LEVERAGE = 20
+TP = 0.02
+THRESHOLDS = [1.05, 1.12]
+MAX_RETRIES = 3  # 请求重试次数
+
+# ================== 工具函数 ==================
+def big_green(open_price, close_price, ratio):
+    return close_price > open_price * ratio
+
+def candle_down(open_price, close_price):
+    return close_price < open_price
+
+def request_with_retry(url, timeout):
+    """请求 Binance API 带重试"""
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = requests.get(url, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(1)  # 等待1秒再重试
+            else:
+                raise e
+
+def get_symbols():
+    url = f"{BASE_URL}/fapi/v1/exchangeInfo"
+    resp = request_with_retry(url, timeout=10)
+    symbols = [s['symbol'] for s in resp['symbols'] 
+               if s['contractType']=="PERPETUAL" and s['quoteAsset']=="USDT"]
+    return symbols
+
+def get_recent_klines(symbol, interval="1d", limit=3):
+    url = f"{BASE_URL}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    data = request_with_retry(url, timeout=10)
+    klines = []
+    for k in data:
+        klines.append({
+            "open_time": k[0],
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": float(k[4]),
+            "volume": float(k[5])
+        })
+    return pd.DataFrame(klines)
+
+def get_full_klines(symbol, interval="1d"):
+    all_klines = []
+    limit = 1000
+    start_time = None
+    while True:
+        url = f"{BASE_URL}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
+        if start_time:
+            url += f"&endTime={start_time}"
+        data = request_with_retry(url, timeout=25)
+        if not data or len(data) == 0:
+            break
+        for k in data:
+            all_klines.append({
+                "open_time": k[0],
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+                "volume": float(k[5])
+            })
+        earliest_time = data[0][0]
+        if len(data) < limit or earliest_time == start_time:
+            break
+        start_time = earliest_time - 1
+    df = pd.DataFrame(all_klines)
+    df = df.sort_values("open_time").reset_index(drop=True)
+    return df
+
+# ================== 回测函数 ==================
+def backtest_symbol(df_s, ratio):
+    trades = []
+    n = len(df_s)
+    for i in range(1, n-2):
+        prev = df_s.iloc[i-1]
+        curr = df_s.iloc[i]
+        next_candle = df_s.iloc[i+1]
+        if big_green(prev['open'], prev['close'], ratio) and candle_down(curr['open'], curr['close']):
+            entry_price = next_candle['open']
+            tp_price = entry_price * (1 - TP)
+            exit_price = entry_price
+            peak_loss = 0
+            held_days = 0
+            for j in range(next_candle.name, n):
+                high = df_s.iloc[j]['high']
+                low = df_s.iloc[j]['low']
+                if low <= tp_price:
+                    exit_price = tp_price
+                    held_days = j - next_candle.name + 1
+                    break
+                peak_loss = max(peak_loss, (high - entry_price)/entry_price*INVEST*LEVERAGE)
+            else:
+                exit_price = df_s.iloc[-1]['close']
+                held_days = df_s.iloc[-1].name - next_candle.name + 1
+            profit = (entry_price - exit_price)/entry_price * INVEST * LEVERAGE
+            trades.append({
+                "threshold": ratio,
+                "entry_date": next_candle.name,
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "held_days": held_days,
+                "profit": round(profit,2),
+                "max_drawdown": round(peak_loss,2)
+            })
+    return trades
+
+def summarize_trades(trades):
+    if not trades:
+        return None
+    df = pd.DataFrame(trades)
+    triggers = len(df)
+    wins = len(df[df['profit']>0])
+    losses = triggers - wins
+    winrate = wins/triggers*100 if triggers>0 else 0
+    max_held = df['held_days'].max()
+    max_dd = df['max_drawdown'].max()
+    total_profit = df['profit'].sum()
+    return {
+        "triggers": triggers,
+        "wins": wins,
+        "losses": losses,
+        "winrate": winrate,
+        "max_held": max_held,
+        "max_drawdown": max_dd,
+        "total_profit": total_profit
+    }
+
+# ================== 扫描函数 ==================
+def scan():
+    symbols = get_symbols()
+    print(f"✅ 获取到 {len(symbols)} 个 USDT 永续合约")
+
+    for sym in tqdm(symbols, desc="扫描进度"):
+        try:
+            df_recent = get_recent_klines(sym)
+            if len(df_recent) < 3:
+                print(f"⚪ {sym} 数据不足3根K线，跳过")
+                continue
+            prev, curr, next_candle = df_recent.iloc[-3], df_recent.iloc[-2], df_recent.iloc[-1]
+            last_price = next_candle['close']
+            triggered = False
+            for thresh in THRESHOLDS:
+                if big_green(prev['open'], prev['close'], thresh) and candle_down(curr['open'], curr['close']):
+                    triggered = True
+                    df_hist = get_full_klines(sym)
+                    trades = backtest_symbol(df_hist, thresh)
+                    summary = summarize_trades(trades)
+                    signal_type = "稳健信号（大阳超 12%）" if thresh==1.12 else "普通信号（大阳超 5%）"
+                    print("\n" + "="*80)
+                    print(f"📌 合约: {sym}")
+                    print(f"⏰ 扫描时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                    print(f"⚡ 信号类型: {signal_type}")
+                    print(f"📈 阈值: {thresh:.2f}")
+                    print(f"💰 投资金额: {INVEST} USDT | 杠杆: {LEVERAGE}x")
+                    print(f"🟢 建议入场价: {next_candle['open']}")
+                    print(f"🔴 最新价格: {last_price} ({'高于开仓价越好做空' if last_price>next_candle['open'] else '接近开仓价越好'})")
+                    if summary:
+                        print(f"📊 历史触发次数: {summary['triggers']}")
+                        print(f"胜率: {summary['winrate']:.2f}% | 盈利次数: {summary['wins']} | 亏损次数: {summary['losses']}")
+                        print(f"最长持仓天数: {summary['max_held']} | 最大浮亏: {summary['max_drawdown']:.2f} USDT")
+                        print(f"累计净收益: {summary['total_profit']:.2f} USDT")
+                    else:
+                        print("⚠ 历史回测无信号记录")
+                    print("="*80)
+            if not triggered:
+                print(f"⚪ {sym} 没有触发信号")
+        except Exception as e:
+            print(f"⚠ 扫描 {sym} 出错: {e}")
+
+if __name__ == "__main__":
+    scan()
