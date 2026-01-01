@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-📊 本地 CSV 双阈值 BIG_GREEN_THEN_RED_SHORT 回测
+📊 本地 CSV 双阈值 BIG_GREEN_THEN_RED_SHORT 回测（固定 TP 2%）
 逻辑：
 - 前一天大阳超过阈值
 - 当天收阴 -> 第二天开空
-- 持有到最后一根K线
+- 止盈固定 2%
+- 不设止损，持仓到最后一根 K 或触及止盈
 - 双阈值 1.07 / 1.08
 - 输出交易记录 CSV + 控制台风险画像
 """
@@ -13,10 +14,11 @@ import pandas as pd
 
 # ================= 参数 =================
 CSV_FILE = r"C:\Users\JZDD\Desktop\all_usdt_perp_1d_20260101_1625.csv"
-OUTPUT_CSV = r"C:\Users\JZDD\Desktop\big_green_red_backtest.csv"
+OUTPUT_CSV = r"C:\Users\JZDD\Desktop\big_green_red_backtest_tp2.csv"
 THRESHOLDS = [1.07, 1.08]
 INVEST = 20
 LEVERAGE = 20
+TP = 0.02  # 止盈比例
 
 # ================= 读取数据 =================
 df = pd.read_csv(CSV_FILE)
@@ -40,14 +42,32 @@ def backtest_symbol(df_s, ratio):
             entry_price = next_candle["open"]
             entry_date = next_candle["date"]
 
-            # 持仓到最后一根K线
-            exit_price = df_s.iloc[-1]["close"]
-            exit_date = df_s.iloc[-1]["date"]
-            held_days = (df_s.iloc[-1].name - next_candle.name) + 1
+            # 止盈价格（空单）
+            tp_price = entry_price * (1 - TP)
 
-            # 最大浮亏：空单，高点相对入场
-            peak_loss = ((df_s.iloc[next_candle.name:i+1+held_days]["high"].max() - entry_price)/entry_price*INVEST*LEVERAGE) if held_days>0 else 0
-            profit = (entry_price - exit_price) * INVEST * LEVERAGE / entry_price
+            # 持仓到触及止盈或者最后一根K线
+            exit_price = entry_price  # 初始
+            exit_date = entry_date
+            peak_loss = 0
+            for j in range(next_candle.name, n):
+                high = df_s.iloc[j]["high"]
+                low = df_s.iloc[j]["low"]
+                # 空单触及止盈
+                if low <= tp_price:
+                    exit_price = tp_price
+                    exit_date = df_s.iloc[j]["date"]
+                    held_days = j - next_candle.name + 1
+                    break
+                # 更新浮亏（空单高点）
+                peak_loss = max(peak_loss, (high - entry_price)/entry_price*INVEST*LEVERAGE)
+            else:
+                # 没到止盈就持仓到最后一根
+                exit_price = df_s.iloc[-1]["close"]
+                exit_date = df_s.iloc[-1]["date"]
+                held_days = df_s.iloc[-1].name - next_candle.name + 1
+
+            # 计算盈利（空单）
+            profit = (entry_price - exit_price)/entry_price * INVEST * LEVERAGE
 
             trades.append({
                 "symbol": df_s.iloc[0]["symbol"],
@@ -92,3 +112,5 @@ if all_trades:
         print(f"📊 阈值 {ratio} 风险画像")
         print(f"触发次数: {triggers}")
         print(f"盈利次数: {wins} | 亏损次数: {losses} | 胜率: {winrate:.2f}%")
+        print(f"最长持仓天数: {max_held} 天")
+        print(f"最大浮亏: {max_dd} USDT")
