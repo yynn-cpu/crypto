@@ -1,0 +1,67 @@
+# -*- coding: utf-8 -*-
+"""
+实盘 BIG_GREEN_THEN_RED_SHORT 扫描器
+"""
+import requests
+import pandas as pd
+from datetime import datetime
+
+BASE_URL = "https://fapi.binance.com"
+BACKTEST_FILE = r"C:\Users\JZDD\Desktop\backtest_logic1_logic2\backtest_TP2.csv"
+SYMBOLS = []  # 留空则获取所有 USDT 永续
+
+LEVERAGE = 20
+
+# ================= 辅助函数 =================
+def candle_down(candle):
+    return candle['close'] < candle['open']
+
+def trigger_BIG_GREEN_THEN_RED_SHORT(df_s, idx):
+    if idx < 1:
+        return False
+    prev = df_s.iloc[idx-1]
+    last = df_s.iloc[idx]
+    return (prev['close'] > prev['open']*1.07) and candle_down(last)
+
+def get_all_usdt_symbols():
+    info = requests.get(f"{BASE_URL}/fapi/v1/exchangeInfo").json()
+    symbols = [s['symbol'] for s in info['symbols'] if s['quoteAsset'] == "USDT" and s['contractType'] == 'PERPETUAL']
+    return symbols
+
+def get_klines(symbol, interval="1d", limit=5):
+    url = f"{BASE_URL}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    data = requests.get(url).json()
+    df = pd.DataFrame(data, columns=['open_time','open','high','low','close','volume','close_time','qav','trades','taker_base','taker_quote','ignore'])
+    for col in ['open','high','low','close','volume']:
+        df[col] = df[col].astype(float)
+    df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+    return df
+
+# ================= 回测数据读取 =================
+backtest_df = pd.read_csv(BACKTEST_FILE)
+
+# ================= 扫描器 =================
+if not SYMBOLS:
+    SYMBOLS = get_all_usdt_symbols()
+
+print(f"[{datetime.now()}] 开始扫描 {len(SYMBOLS)} 个 USDT 永续合约...")
+
+for sym in SYMBOLS:
+    try:
+        df_s = get_klines(sym)
+        if trigger_BIG_GREEN_THEN_RED_SHORT(df_s, len(df_s)-1):
+            # 找到回测数据里的对应记录
+            df_bt = backtest_df[backtest_df['symbol']==sym]
+            if len(df_bt) > 0:
+                max_dd = df_bt['max_drawdown'].max()
+                avg_held = df_bt['held_days'].mean()
+                total_profit = df_bt['profit'].sum()
+            else:
+                max_dd = avg_held = total_profit = 0
+
+            print(f"✅ 符合信号: {sym} | 最新收盘: {df_s.iloc[-1]['close']:.4f} USDT")
+            print(f"   历史净收益: {total_profit:.2f} USDT | 平均抗单天数: {avg_held:.2f} | 最大单笔浮亏: {max_dd:.2f}")
+    except Exception as e:
+        print(f"⚠ {sym} 获取K线失败: {e}")
+
+print(f"[{datetime.now()}] 扫描完成。")
