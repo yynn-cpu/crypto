@@ -1,117 +1,94 @@
 # -*- coding: utf-8 -*-
 """
-本地 CSV 回测｜1.07 / 1.08 双阈值
+📊 本地 CSV 双阈值 BIG_GREEN_THEN_RED_SHORT 回测
+逻辑：
+- 前一天大阳超过阈值
+- 当天收阴 -> 第二天开空
+- 持有到最后一根K线
+- 双阈值 1.07 / 1.08
+- 输出交易记录 CSV + 控制台风险画像
 """
 
 import pandas as pd
-from tqdm import tqdm
 
 # ================= 参数 =================
-CSV_PATH = r"C:\Users\JZDD\Desktop\all_usdt_perp_1d_20260101_1625.csv"
-
+CSV_FILE = r"C:\Users\JZDD\Desktop\all_usdt_perp_1d_20260101_1625.csv"
+OUTPUT_CSV = r"C:\Users\JZDD\Desktop\big_green_red_backtest.csv"
 THRESHOLDS = [1.07, 1.08]
-TAKE_PROFIT = 0.02
-INVEST_USDT = 100
+INVEST = 20
 LEVERAGE = 20
 
 # ================= 读取数据 =================
-df = pd.read_csv(CSV_PATH)
+df = pd.read_csv(CSV_FILE)
+df[["open","high","low","close"]] = df[["open","high","low","close"]].astype(float)
+df["date"] = pd.to_datetime(df["date"])
+df = df.sort_values(["symbol","date"]).reset_index(drop=True)
 
-df[['open', 'high', 'low', 'close']] = df[['open', 'high', 'low', 'close']].astype(float)
-
-# 确保同一合约按时间排序
-df = df.sort_values(['symbol', 'date']).reset_index(drop=True)
-
-# ================= 信号函数 =================
-
-def candle_down(c):
-    return c['close'] < c['open']
-
-def big_green(c, ratio):
-    return c['close'] > c['open'] * ratio
+# ================= 工具函数 =================
+def candle_down(c): return c['close'] < c['open']
+def big_green(c, ratio): return c['close'] > c['open'] * ratio
 
 # ================= 回测函数 =================
-
-def backtest(symbol_df, ratio):
-    wins = 0
-    losses = 0
-    max_drawdown = 0
-    max_hold_days = 0
-
-    for i in range(len(symbol_df) - 2):
-        prev = symbol_df.iloc[i]
-        curr = symbol_df.iloc[i + 1]
-
+def backtest_symbol(df_s, ratio):
+    trades = []
+    n = len(df_s)
+    for i in range(1, n-1):  # 从第二行开始
+        prev = df_s.iloc[i-1]
+        curr = df_s.iloc[i]
+        next_candle = df_s.iloc[i+1]
         if big_green(prev, ratio) and candle_down(curr):
-            entry = symbol_df.iloc[i + 2]['open']
-            tp = entry * (1 - TAKE_PROFIT)
+            entry_price = next_candle["open"]
+            entry_date = next_candle["date"]
 
-            peak_loss = 0
-            hold_days = 0
+            # 持仓到最后一根K线
+            exit_price = df_s.iloc[-1]["close"]
+            exit_date = df_s.iloc[-1]["date"]
+            held_days = (df_s.iloc[-1].name - next_candle.name) + 1
 
-            for j in range(i + 2, len(symbol_df)):
-                k = symbol_df.iloc[j]
-                hold_days += 1
+            # 最大浮亏：空单，高点相对入场
+            peak_loss = ((df_s.iloc[next_candle.name:i+1+held_days]["high"].max() - entry_price)/entry_price*INVEST*LEVERAGE) if held_days>0 else 0
+            profit = (entry_price - exit_price) * INVEST * LEVERAGE / entry_price
 
-                # 空单浮亏 = 最高价上涨
-                drawdown = (k['high'] - entry) / entry * INVEST_USDT * LEVERAGE
-                peak_loss = max(peak_loss, drawdown)
-
-                if k['low'] <= tp:
-                    wins += 1
-                    break
-            else:
-                losses += 1
-
-            max_drawdown = max(max_drawdown, peak_loss)
-            max_hold_days = max(max_hold_days, hold_days)
-
-    total = wins + losses
-    winrate = wins / total * 100 if total else 0
-
-    return {
-        "triggers": total,
-        "wins": wins,
-        "losses": losses,
-        "winrate": round(winrate, 2),
-        "max_hold_days": max_hold_days,
-        "max_drawdown_usdt": round(max_drawdown, 2)
-    }
+            trades.append({
+                "symbol": df_s.iloc[0]["symbol"],
+                "logic": f"BIG_GREEN_THEN_RED_SHORT_{ratio}",
+                "threshold": ratio,
+                "entry_date": entry_date,
+                "entry_price": entry_price,
+                "exit_date": exit_date,
+                "exit_price": exit_price,
+                "held_days": held_days,
+                "profit": round(profit,2),
+                "max_drawdown": round(peak_loss,2)
+            })
+    return trades
 
 # ================= 主程序 =================
+all_trades = []
+symbols = df["symbol"].unique()
 
-symbols = df['symbol'].unique()
+for sym in symbols:
+    df_s = df[df["symbol"]==sym].reset_index(drop=True)
+    for ratio in THRESHOLDS:
+        trades = backtest_symbol(df_s, ratio)
+        all_trades.extend(trades)
 
-for ratio in THRESHOLDS:
-    print("\n" + "=" * 60)
-    print(f"📊 回测阈值：{ratio}")
+# ================= 输出 =================
+if all_trades:
+    out_df = pd.DataFrame(all_trades)
+    out_df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+    print(f"\n✅ 回测完成，交易记录已保存: {OUTPUT_CSV}")
 
-    agg = {
-        "triggers": 0,
-        "wins": 0,
-        "losses": 0,
-        "max_hold_days": 0,
-        "max_drawdown_usdt": 0
-    }
-
-    for symbol in tqdm(symbols, desc=f"阈值 {ratio} 回测进度"):
-        s_df = df[df['symbol'] == symbol].reset_index(drop=True)
-        if len(s_df) < 10:
-            continue
-
-        r = backtest(s_df, ratio)
-
-        for k in agg:
-            if k in r:
-                agg[k] = max(agg[k], r[k]) if 'max_' in k else agg[k] + r[k]
-
-    total = agg['wins'] + agg['losses']
-    winrate = agg['wins'] / total * 100 if total else 0
-
-    print(f"""
-触发次数: {agg['triggers']}
-盈利次数: {agg['wins']} | 亏损次数: {agg['losses']}
-胜率: {winrate:.2f}%
-最大持仓天数: {agg['max_hold_days']}
-最大单笔浮亏: {agg['max_drawdown_usdt']} USDT
-""")
+    # 控制台风险画像
+    for ratio in THRESHOLDS:
+        df_r = out_df[out_df["threshold"]==ratio]
+        triggers = len(df_r)
+        wins = len(df_r[df_r["profit"]>0])
+        losses = triggers - wins
+        winrate = wins/triggers*100 if triggers>0 else 0
+        max_held = df_r["held_days"].max()
+        max_dd = df_r["max_drawdown"].max()
+        print("\n" + "="*60)
+        print(f"📊 阈值 {ratio} 风险画像")
+        print(f"触发次数: {triggers}")
+        print(f"盈利次数: {wins} | 亏损次数: {losses} | 胜率: {winrate:.2f}%")
