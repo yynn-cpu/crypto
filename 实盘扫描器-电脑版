@@ -1,141 +1,172 @@
 # -*- coding: utf-8 -*-
 """
-🚨 Binance USDT 永续｜实盘扫描器（只扫描两个强信号逻辑）
-逻辑：
-1. B_4DOWN_LONG：连续4天下跌 → 第二天开盘做多
-2. BIG_GREEN_THEN_RED_SHORT：前一天大阳反包 → 第二天开盘做空
+逻辑回测：4天连续阴做多 + 大阳反包做空
+止盈: 2%
+数据：all_usdt_perp_1d_20260101_1005.csv
+输出：每笔交易详细信息
 """
-import pandas as pd
-import requests
-from datetime import datetime
-import time
 
-# ================== 参数 ==================
-BASE_URL = "https://fapi.binance.com"
+import pandas as pd
+import os
+from tqdm import tqdm
+
+# ================= 参数 =================
+DATA_FILE = r"C:\Users\JZDD\Desktop\all_usdt_perp_1d_20260101_1005.csv"
+OUTPUT_DIR = r"C:\Users\JZDD\Desktop\backtest_logic1_logic2"
 INVEST = 20
 LEVERAGE = 20
-TP = 0.02  # 固定止盈 2%
-KLINE_LIMIT = 5
-BLACKLIST = ["TRXUSDT"]  # 黑名单
-HISTORY_FILE = r"C:\Users\JZDD\Desktop\backtest_strict\logic17_trades_STRICT.csv"
+TP = 2  # 止盈2%
+BLACKLIST = {
+    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","DOGEUSDT",
+    "ADAUSDT","AVAXUSDT","LTCUSDT","BCHUSDT","TONUSDT"
+}
 
-# ================== 读取历史回测 ==================
-trades_df = pd.read_csv(HISTORY_FILE)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ================== 获取所有 USDT 永续 ==================
-def get_usdt_symbols():
-    url = f"{BASE_URL}/fapi/v1/exchangeInfo"
-    data = requests.get(url, timeout=10).json()
-    symbols = [s["symbol"] for s in data["symbols"] if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
-    return symbols
+# ================= 读取数据 =================
+df = pd.read_csv(DATA_FILE)
+if 'date' in df.columns:
+    df['date'] = pd.to_datetime(df['date'])
+elif 'open_time' in df.columns:
+    df['date'] = pd.to_datetime(df['open_time'], unit='ms')
+else:
+    raise ValueError("找不到时间字段 date / open_time")
 
-# ================== 获取最近 K 线 ==================
-def fetch_last_k(symbol, limit=KLINE_LIMIT):
-    url = f"{BASE_URL}/fapi/v1/klines"
-    params = {"symbol": symbol, "interval": "1d", "limit": limit}
-    r = requests.get(url, params=params, timeout=10).json()
-    if not isinstance(r, list) or len(r) < limit:
-        return None
-    df = pd.DataFrame(r, columns=[
-        "open_time","open","high","low","close","volume",
-        "close_time","quote_volume","trades","tb_base_av","tb_quote_av","ignore"
-    ])
-    df[["open","high","low","close","volume"]] = df[["open","high","low","close","volume"]].astype(float)
-    return df
+df = df.sort_values(['symbol', 'date']).reset_index(drop=True)
+symbols = [s for s in df['symbol'].unique() if s not in BLACKLIST]
 
-# ================== K 线工具 ==================
-def candle_down(c):
-    return c["close"] < c["open"]
+# ================= K线工具 =================
+def candle_down(row):
+    return row['close'] < row['open']
 
-def candle_up(c):
-    return c["close"] > c["open"]
-
-# ================== 逻辑判断 ==================
-def trigger_B_4DOWN_LONG(df):
-    if len(df) < 5:
+# ================= 逻辑 =================
+def trigger_B_4DOWN_LONG(df_s, idx):
+    if idx < 4:
         return False
-    # 前4天连续阴线
-    return all(candle_down(df.iloc[i]) for i in range(-5, -1))
+    return all(candle_down(df_s.iloc[i]) for i in range(idx-4, idx))
 
-def trigger_BIG_GREEN_THEN_RED_SHORT(df):
-    if len(df) < 2:
+def trigger_BIG_GREEN_THEN_RED_SHORT(df_s, idx):
+    if idx < 1:
         return False
-    prev = df.iloc[-2]
-    last = df.iloc[-1]
-    # 前一天大阳反包 + 当天收盘形成大阴反包
-    return (prev["close"] > prev["open"]*1.07) and candle_down(last)
+    prev = df_s.iloc[idx-1]
+    last = df_s.iloc[idx]
+    return (prev['close'] > prev['open']*1.07) and candle_down(last)
 
-# ================== 历史表现 ==================
-def get_history(symbol, logic_name):
-    df = trades_df[(trades_df["symbol"]==symbol) & (trades_df["logic"]==logic_name)]
-    if df.empty:
-        return None
-    trades = len(df)
-    win_rate = round((df["profit"]>0).mean()*100,2)
-    total_profit = round(df["profit"].sum(),2)
-    avg_held = round(df["held_days"].mean(),2)
-    max_dd = round(df["max_dd"].max(),2)
-    return trades, win_rate, total_profit, avg_held, max_dd
+# ================= 单币回测 =================
+def backtest_symbol(df_s, tp):
+    trades_l1 = []
+    trades_l2 = []
 
-# ================== 实时扫描 ==================
-symbols = get_usdt_symbols()
-total = len(symbols)
-print("="*80)
-print(f"🚨 Binance USDT 永续｜实盘扫描启动（强信号逻辑）")
-print("逻辑：B_4DOWN_LONG / BIG_GREEN_THEN_RED_SHORT")
-print("时间：", datetime.now())
-print("="*80)
+    for i in range(4, len(df_s)):
+        row = df_s.iloc[i]
 
-for idx, symbol in enumerate(symbols, 1):
-    if symbol in BLACKLIST:
-        print(f"[{idx}/{total}] {symbol} 在黑名单中，跳过")
+        # 逻辑1
+        if trigger_B_4DOWN_LONG(df_s, i):
+            entry_price = row['open']
+            tp_price = entry_price * (1 + tp/100)
+            entry_date = row['date']
+            max_dd = 0
+            held_days = 0
+            exit_price = None
+            exit_date = None
+
+            for j in range(i, len(df_s)):
+                high = df_s.iloc[j]['high']
+                low = df_s.iloc[j]['low']
+                held_days += 1
+                dd = (entry_price - low)/entry_price * LEVERAGE * INVEST
+                max_dd = max(max_dd, dd)
+                if high >= tp_price:
+                    exit_price = tp_price
+                    exit_date = df_s.iloc[j]['date']
+                    break
+            if exit_price is None:
+                exit_price = df_s.iloc[-1]['close']
+                exit_date = df_s.iloc[-1]['date']
+
+            trades_l1.append({
+                "symbol": df_s.iloc[i]['symbol'],
+                "logic": "4DOWN_LONG",
+                "entry_date": entry_date,
+                "entry_price": entry_price,
+                "exit_date": exit_date,
+                "exit_price": exit_price,
+                "profit": (exit_price - entry_price)/entry_price * LEVERAGE * INVEST,
+                "held_days": held_days,
+                "max_drawdown": max_dd
+            })
+
+        # 逻辑2
+        if trigger_BIG_GREEN_THEN_RED_SHORT(df_s, i):
+            entry_price = row['open']
+            tp_price = entry_price * (1 - tp/100)
+            entry_date = row['date']
+            max_dd = 0
+            held_days = 0
+            exit_price = None
+            exit_date = None
+
+            for j in range(i, len(df_s)):
+                high = df_s.iloc[j]['high']
+                low = df_s.iloc[j]['low']
+                held_days += 1
+                dd = (high - entry_price)/entry_price * LEVERAGE * INVEST
+                max_dd = max(max_dd, dd)
+                if low <= tp_price:
+                    exit_price = tp_price
+                    exit_date = df_s.iloc[j]['date']
+                    break
+            if exit_price is None:
+                exit_price = df_s.iloc[-1]['close']
+                exit_date = df_s.iloc[-1]['date']
+
+            trades_l2.append({
+                "symbol": df_s.iloc[i]['symbol'],
+                "logic": "BIG_GREEN_THEN_RED_SHORT",
+                "entry_date": entry_date,
+                "entry_price": entry_price,
+                "exit_date": exit_date,
+                "exit_price": exit_price,
+                "profit": (entry_price - exit_price)/entry_price * LEVERAGE * INVEST,
+                "held_days": held_days,
+                "max_drawdown": max_dd
+            })
+
+    return trades_l1, trades_l2
+
+# ================= 主回测 =================
+all_trades_l1 = []
+all_trades_l2 = []
+
+print(f"=== 开始回测 止盈 {TP}% ===")
+for sym in tqdm(symbols, desc="回测进度"):
+    df_s = df[df['symbol']==sym].reset_index(drop=True)
+    if len(df_s) < 10:
         continue
+    t1, t2 = backtest_symbol(df_s, TP)
+    all_trades_l1.extend(t1)
+    all_trades_l2.extend(t2)
 
-    df = fetch_last_k(symbol)
-    if df is None:
-        print(f"[{idx}/{total}] {symbol} K线数据不足，跳过")
-        continue
+# 统计逻辑1
+df_l1 = pd.DataFrame(all_trades_l1)
+if not df_l1.empty:
+    wins = df_l1[df_l1['profit']>0]
+    losses = df_l1[df_l1['profit']<=0]
+    print(f"\n[逻辑1 4DOWN_LONG] 止盈 {TP}% 总览")
+    print(f"触发次数: {len(df_l1)} | 盈利: {len(wins)} | 亏损: {len(losses)} | 胜率: {len(wins)/len(df_l1)*100:.2f}%")
+    print(f"总盈利: {wins['profit'].sum():.2f} USDT | 总亏损: {losses['profit'].sum():.2f} USDT | 净收益: {df_l1['profit'].sum():.2f} USDT")
+    print(f"平均抗单天数: {df_l1['held_days'].mean():.2f} | 最大浮亏: {df_l1['max_drawdown'].max():.2f} USDT")
 
-    # 触发逻辑
-    trigger_B4 = trigger_B_4DOWN_LONG(df)
-    trigger_BGTR = trigger_BIG_GREEN_THEN_RED_SHORT(df)
+# 统计逻辑2
+df_l2 = pd.DataFrame(all_trades_l2)
+if not df_l2.empty:
+    wins = df_l2[df_l2['profit']>0]
+    losses = df_l2[df_l2['profit']<=0]
+    print(f"\n[逻辑2 BIG_GREEN_THEN_RED_SHORT] 止盈 {TP}% 总览")
+    print(f"触发次数: {len(df_l2)} | 盈利: {len(wins)} | 亏损: {len(losses)} | 胜率: {len(wins)/len(df_l2)*100:.2f}%")
+    print(f"总盈利: {wins['profit'].sum():.2f} USDT | 总亏损: {losses['profit'].sum():.2f} USDT | 净收益: {df_l2['profit'].sum():.2f} USDT")
+    print(f"平均抗单天数: {df_l2['held_days'].mean():.2f} | 最大浮亏: {df_l2['max_drawdown'].max():.2f} USDT")
 
-    # 历史表现
-    hist_B4 = get_history(symbol, "B_4DOWN_LONG")
-    hist_BGTR = get_history(symbol, "BIG_GREEN_THEN_RED_SHORT")
-
-    # 显示
-    print(f"[{idx}/{total}] {symbol}")
-
-    if trigger_B4:
-        entry_price = df.iloc[-1]["open"]  # 第二天开盘入场
-        tp_price = round(entry_price*(1+TP),6)
-        potential_profit = round(INVEST * LEVERAGE * TP,2)
-        print(f"  ✅ B_4DOWN_LONG 触发 | 做多 Long | 入场价：{entry_price} | 投资：{INVEST}U | 杠杆：{LEVERAGE}x | TP：{tp_price} | 潜在盈利：{potential_profit}USDT")
-        if hist_B4:
-            trades, win_rate, total_profit, avg_held, max_dd = hist_B4
-            print(f"    历史表现：{trades}次交易，胜率{win_rate}% ，总盈利{total_profit}USDT，平均持仓{avg_held}天，最大回撤{max_dd}")
-    else:
-        print("  ❌ B_4DOWN_LONG 未触发")
-
-    if trigger_BGTR:
-        entry_price = df.iloc[-1]["open"]
-        tp_price = round(entry_price*(1-TP),6)
-        potential_profit = round(INVEST * LEVERAGE * TP,2)
-        print(f"  ✅ BIG_GREEN_THEN_RED_SHORT 触发 | 做空 Short | 入场价：{entry_price} | 投资：{INVEST}U | 杠杆：{LEVERAGE}x | TP：{tp_price} | 潜在盈利：{potential_profit}USDT")
-        if hist_BGTR:
-            trades, win_rate, total_profit, avg_held, max_dd = hist_BGTR
-            print(f"    历史表现：{trades}次交易，胜率{win_rate}% ，总盈利{total_profit}USDT，平均持仓{avg_held}天，最大回撤{max_dd}")
-    else:
-        print("  ❌ BIG_GREEN_THEN_RED_SHORT 未触发")
-
-    # 进度显示百分比
-    if idx % 10 == 0 or idx == total:
-        pct = round(idx/total*100,2)
-        print(f"📊 进度：{pct}%")
-    
-    time.sleep(0.5)  # 避免频繁请求
-
-print("="*80)
-print("✅ 实盘扫描完成")
-print("="*80)
+# 保存详细交易明细
+pd.concat([df_l1, df_l2]).to_csv(os.path.join(OUTPUT_DIR, f"backtest_TP{TP}.csv"), index=False)
+print(f"✅ 交易明细已保存: {OUTPUT_DIR}\\backtest_TP{TP}.csv")
