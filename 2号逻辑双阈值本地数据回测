@@ -1,0 +1,117 @@
+# -*- coding: utf-8 -*-
+"""
+本地 CSV 回测｜1.07 / 1.08 双阈值
+"""
+
+import pandas as pd
+from tqdm import tqdm
+
+# ================= 参数 =================
+CSV_PATH = r"C:\Users\JZDD\Desktop\all_usdt_perp_1d_20260101_1625.csv"
+
+THRESHOLDS = [1.07, 1.08]
+TAKE_PROFIT = 0.02
+INVEST_USDT = 100
+LEVERAGE = 20
+
+# ================= 读取数据 =================
+df = pd.read_csv(CSV_PATH)
+
+df[['open', 'high', 'low', 'close']] = df[['open', 'high', 'low', 'close']].astype(float)
+
+# 确保同一合约按时间排序
+df = df.sort_values(['symbol', 'date']).reset_index(drop=True)
+
+# ================= 信号函数 =================
+
+def candle_down(c):
+    return c['close'] < c['open']
+
+def big_green(c, ratio):
+    return c['close'] > c['open'] * ratio
+
+# ================= 回测函数 =================
+
+def backtest(symbol_df, ratio):
+    wins = 0
+    losses = 0
+    max_drawdown = 0
+    max_hold_days = 0
+
+    for i in range(len(symbol_df) - 2):
+        prev = symbol_df.iloc[i]
+        curr = symbol_df.iloc[i + 1]
+
+        if big_green(prev, ratio) and candle_down(curr):
+            entry = symbol_df.iloc[i + 2]['open']
+            tp = entry * (1 - TAKE_PROFIT)
+
+            peak_loss = 0
+            hold_days = 0
+
+            for j in range(i + 2, len(symbol_df)):
+                k = symbol_df.iloc[j]
+                hold_days += 1
+
+                # 空单浮亏 = 最高价上涨
+                drawdown = (k['high'] - entry) / entry * INVEST_USDT * LEVERAGE
+                peak_loss = max(peak_loss, drawdown)
+
+                if k['low'] <= tp:
+                    wins += 1
+                    break
+            else:
+                losses += 1
+
+            max_drawdown = max(max_drawdown, peak_loss)
+            max_hold_days = max(max_hold_days, hold_days)
+
+    total = wins + losses
+    winrate = wins / total * 100 if total else 0
+
+    return {
+        "triggers": total,
+        "wins": wins,
+        "losses": losses,
+        "winrate": round(winrate, 2),
+        "max_hold_days": max_hold_days,
+        "max_drawdown_usdt": round(max_drawdown, 2)
+    }
+
+# ================= 主程序 =================
+
+symbols = df['symbol'].unique()
+
+for ratio in THRESHOLDS:
+    print("\n" + "=" * 60)
+    print(f"📊 回测阈值：{ratio}")
+
+    agg = {
+        "triggers": 0,
+        "wins": 0,
+        "losses": 0,
+        "max_hold_days": 0,
+        "max_drawdown_usdt": 0
+    }
+
+    for symbol in tqdm(symbols, desc=f"阈值 {ratio} 回测进度"):
+        s_df = df[df['symbol'] == symbol].reset_index(drop=True)
+        if len(s_df) < 10:
+            continue
+
+        r = backtest(s_df, ratio)
+
+        for k in agg:
+            if k in r:
+                agg[k] = max(agg[k], r[k]) if 'max_' in k else agg[k] + r[k]
+
+    total = agg['wins'] + agg['losses']
+    winrate = agg['wins'] / total * 100 if total else 0
+
+    print(f"""
+触发次数: {agg['triggers']}
+盈利次数: {agg['wins']} | 亏损次数: {agg['losses']}
+胜率: {winrate:.2f}%
+最大持仓天数: {agg['max_hold_days']}
+最大单笔浮亏: {agg['max_drawdown_usdt']} USDT
+""")
