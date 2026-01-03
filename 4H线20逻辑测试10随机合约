@@ -1,0 +1,154 @@
+# -*- coding: utf-8 -*-
+"""
+Binance USDT 永续｜4H 多逻辑做空回测系统
+20 个逻辑 × 20 合约
+20U × 20倍 ｜止盈 2% ｜无止损
+"""
+
+import requests, random, time
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+BASE_URL = "https://fapi.binance.com"
+KLINE_LIMIT = 100
+CAPITAL = 20
+LEVERAGE = 20
+TP_RATE = 0.02
+SYMBOL_COUNT = 20
+
+# ------------------ 工具函数 ------------------
+
+def request(url, params=None):
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except:
+        return None
+
+def get_symbols():
+    data = request(f"{BASE_URL}/fapi/v1/exchangeInfo")
+    return [
+        s["symbol"] for s in data["symbols"]
+        if s["quoteAsset"] == "USDT"
+    ]
+
+def get_klines(symbol):
+    data = request(f"{BASE_URL}/fapi/v1/klines", {
+        "symbol": symbol,
+        "interval": "4h",
+        "limit": KLINE_LIMIT
+    })
+    if not data:
+        return None
+    df = pd.DataFrame(data, columns=[
+        "open_time","open","high","low","close","volume",
+        "close_time","qav","num_trades","taker_base",
+        "taker_quote","ignore"
+    ])
+    for c in ["open","high","low","close","volume"]:
+        df[c] = df[c].astype(float)
+    df["time"] = pd.to_datetime(df["open_time"], unit="ms")
+    return df
+
+def rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+# ------------------ 20 个逻辑 ------------------
+
+def logic_1(df,i): return df.close[i-1] > df.open[i-1]*1.05
+def logic_2(df,i): return df.close[i-1] > df.open[i-1]*1.08
+def logic_3(df,i): return all(df.close[i-j] > df.open[i-j] for j in [1,2])
+def logic_4(df,i): return logic_1(df,i) and df.volume[i-1] > df.volume[i-2]
+
+def logic_5(df,i): return logic_1(df,i) and (df.high[i-1]-df.close[i-1]) > (df.close[i-1]-df.open[i-1])
+def logic_6(df,i): return all(df.close[i-j] > df.open[i-j] for j in [1,2,3])
+def logic_7(df,i): return logic_1(df,i) and abs(df.close[i]-df.open[i]) < (df.high[i]-df.low[i])*0.2
+def logic_8(df,i): return df.close[i-2] < df.open[i-2] and df.close[i-1] > df.open[i-1]
+
+def logic_9(df,i): return df.high[i-1] > df.high[i-2] and df.close[i-1] < df.high[i-2]
+def logic_10(df,i): return logic_9(df,i) and df.close[i] < df.open[i]
+def logic_11(df,i): return df.high[i-1] < df.high[i-2] and df.low[i-1] > df.low[i-2]
+def logic_12(df,i): return df.close[i-1] < df.open[i-1] and df.close[i-2] > df.open[i-2]
+
+def logic_13(df,i): return df.close[i-1] > df.close.rolling(20).mean()[i-1]*1.06
+def logic_14(df,i): return df.close[i-1] > df.close.rolling(60).mean()[i-1]*1.05
+def logic_15(df,i): return df.close.rolling(5).mean()[i-1] > df.close.rolling(20).mean()[i-1]*1.05
+def logic_16(df,i): return df.close.rolling(20).mean()[i-1] < df.close.rolling(20).mean()[i-2]
+
+def logic_17(df,i): return all(df.close[i-j] > df.open[i-j] for j in [1,2,3])
+def logic_18(df,i): return rsi(df.close)[i-1] > 75
+def logic_19(df,i): return rsi(df.close)[i-1] > 80
+def logic_20(df,i): return (df.high[i-1]-df.low[i-1]) > df.close[i-1]*0.08
+
+LOGICS = [logic_1,logic_2,logic_3,logic_4,logic_5,logic_6,logic_7,logic_8,
+          logic_9,logic_10,logic_11,logic_12,logic_13,logic_14,logic_15,logic_16,
+          logic_17,logic_18,logic_19,logic_20]
+
+# ------------------ 回测核心 ------------------
+
+def backtest_logic(logic_fn, symbols):
+    trades = []
+    equity = 0
+    peak = 0
+    max_dd = 0
+
+    for symbol in symbols:
+        df = get_klines(symbol)
+        if df is None or len(df) < 50:
+            continue
+
+        for i in range(20, len(df)-1):
+            if logic_fn(df,i):
+                entry = df.open[i]
+                tp = entry * (1 - TP_RATE)
+                for j in range(i+1, len(df)):
+                    if df.low[j] <= tp:
+                        profit = CAPITAL * LEVERAGE * TP_RATE
+                        equity += profit
+                        peak = max(peak, equity)
+                        max_dd = max(max_dd, peak-equity)
+                        trades.append([
+                            symbol, df.time[i], df.time[j],
+                            (j-i)*4, profit
+                        ])
+                        break
+
+    return trades, equity, max_dd
+
+# ------------------ 主程序 ------------------
+
+def main():
+    symbols = random.sample(get_symbols(), SYMBOL_COUNT)
+    print(f"随机测试合约数: {len(symbols)}")
+
+    for idx,logic in enumerate(LOGICS,1):
+        print(f"\n▶ 逻辑 {idx} 回测中...")
+        trades, pnl, dd = backtest_logic(logic, symbols)
+
+        if not trades:
+            print("无交易")
+            continue
+
+        df = pd.DataFrame(trades, columns=[
+            "symbol","entry_time","exit_time",
+            "holding_hours","profit"
+        ])
+        df.to_csv(f"logic_{idx}_trades.csv", index=False)
+
+        winrate = len(df[df.profit>0]) / len(df) * 100
+        print(f"交易次数: {len(df)}")
+        print(f"胜率: {winrate:.2f}%")
+        print(f"总盈利: {pnl:.2f} USDT")
+        print(f"最大回撤: {dd:.2f} USDT")
+        print(f"平均持仓时间: {df.holding_hours.mean():.2f} 小时")
+
+if __name__ == "__main__":
+    main()
