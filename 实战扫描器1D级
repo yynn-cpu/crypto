@@ -1,0 +1,172 @@
+# -*- coding: utf-8 -*-
+import requests
+import pandas as pd
+from datetime import datetime
+import time
+
+BASE_URL = "https://fapi.binance.com"
+TP = 0.02           # 止盈2%
+INVEST = 20         # 每次投入资金
+LEVERAGE = 20       # 杠杆倍数
+MAX_RETRIES = 3
+
+THRESHOLDS = [1.12, 1.05]  # 顺序：先强信号，后普通信号
+
+# ================= 工具函数 =================
+def big_green(o, c, ratio):
+    return c > o * ratio
+
+def candle_down(o, c):
+    return c < o
+
+def request_with_retry(url, timeout=10):
+    for _ in range(MAX_RETRIES):
+        try:
+            r = requests.get(url, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except:
+            time.sleep(1)
+    return None
+
+def get_symbols():
+    data = request_with_retry(f"{BASE_URL}/fapi/v1/exchangeInfo")
+    if not data:
+        return []
+    return [
+        s["symbol"]
+        for s in data["symbols"]
+        if s["contractType"] == "PERPETUAL"
+        and s["quoteAsset"] == "USDT"
+    ]
+
+def get_recent_klines(symbol):
+    url = f"{BASE_URL}/fapi/v1/klines?symbol={symbol}&interval=1d&limit=3"
+    data = request_with_retry(url)
+    if not data or len(data) < 3:
+        return None
+    return pd.DataFrame([
+        {"open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4])}
+        for k in data
+    ])
+
+def get_full_klines(symbol, interval="1d"):
+    url = f"{BASE_URL}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit=1000"
+    data = request_with_retry(url, timeout=20)
+    if not data:
+        return None
+    return pd.DataFrame([
+        {"open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4])}
+        for k in data
+    ])
+
+# ================= 回测逻辑 =================
+def backtest_symbol(df_s, ratio):
+    trades = []
+    n = len(df_s)
+    if n < 5:
+        return []
+
+    for i in range(1, n - 2):
+        prev, curr, nxt = df_s.iloc[i - 1], df_s.iloc[i], df_s.iloc[i + 1]
+        if big_green(prev["open"], prev["close"], ratio) and candle_down(curr["open"], curr["close"]):
+            entry_price = nxt["open"]
+            tp_price = entry_price * (1 - TP)
+            exit_price = df_s.iloc[-1]["close"]
+            held_days = 0
+            max_dd = 0
+
+            for j in range(i + 1, n):
+                high, low = df_s.iloc[j]["high"], df_s.iloc[j]["low"]
+                held_days += 1
+                max_dd = max(max_dd, (high - entry_price) / entry_price * INVEST * LEVERAGE)
+                if low <= tp_price:
+                    exit_price = tp_price
+                    break
+
+            profit = (entry_price - exit_price) / entry_price * INVEST * LEVERAGE
+            trades.append({
+                "entry": entry_price,
+                "exit": exit_price,
+                "profit": profit,
+                "drawdown": max_dd,
+                "held": held_days
+            })
+    return trades
+
+def summarize_trades(trades):
+    if not trades:
+        return None
+    df = pd.DataFrame(trades)
+    wins = len(df[df["profit"] > 0])
+    losses = len(df) - wins
+    winrate = wins / len(df) * 100
+    max_dd = df["drawdown"].max()
+    max_held = df["held"].max()
+    total_profit = df["profit"].sum()
+    return {
+        "trades": len(df),
+        "winrate": round(winrate, 2),
+        "max_drawdown": round(max_dd, 2),
+        "max_held": max_held,
+        "total_profit": round(total_profit, 2)
+    }
+
+# ================= 主扫描 =================
+def scan():
+    symbols = get_symbols()
+    print("\n================= 日线做空晨扫 =================")
+    print(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"合约数量: {len(symbols)}")
+    print("规则：第1天大阳 → 第2天阴线 → 第3天开盘做空")
+    print("===============================================\n")
+
+    seen_symbols = set()
+
+    for ratio in THRESHOLDS:
+        print(f"\n🔥 开始扫描阈值 {ratio:.2f}")
+        print("-" * 60)
+
+        for idx, sym in enumerate(symbols, 1):
+            print(f"\r进度 {idx}/{len(symbols)}", end="")
+
+            if sym in seen_symbols:
+                continue
+
+            df_recent = get_recent_klines(sym)
+            if df_recent is None or len(df_recent) < 3:
+                continue
+
+            prev, curr, nxt = df_recent.iloc[0], df_recent.iloc[1], df_recent.iloc[2]
+            if big_green(prev["open"], prev["close"], ratio) and candle_down(curr["open"], curr["close"]):
+                df_full = get_full_klines(sym)
+                if df_full is None:
+                    continue
+
+                trades = backtest_symbol(df_full, ratio)
+                summary = summarize_trades(trades)
+
+                label = "大阳 ≥12%" if ratio == 1.12 else "大阳 ≥5%"
+                seen_symbols.add(sym)
+
+                print("\n")
+                print(f"📌 合约: {sym}")
+                print(f"⚡ 信号: {label}")
+                print(f"📈 阈值: {ratio}")
+                print(f"🟢 理论入场价: {nxt['open']}")
+                print(f"🔴 当前收盘价: {nxt['close']}")
+
+                if summary:
+                    print(f"📊 历史触发次数: {summary['trades']}")
+                    print(f"胜率: {summary['winrate']}%")
+                    print(f"最大浮亏: {summary['max_drawdown']} USDT")
+                    print(f"最长持仓天数: {summary['max_held']}")
+                    print(f"累计净收益: {summary['total_profit']} USDT")
+                else:
+                    print("（历史样本太少）")
+                print("-" * 60)
+
+    print("\n✅ 扫描完成")
+
+if __name__ == "__main__":
+    scan()
