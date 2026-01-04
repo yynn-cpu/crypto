@@ -17,6 +17,18 @@
 平均持仓时间（小时 & 天）
 
 
+这个1H逻辑：单子太少，不过胜率特别高。
+BASE_URL = "https://fapi.binance.com"
+INTERVAL = "1h"
+KLINE_LIMIT = 200
+INVEST = 20
+LEVERAGE = 20
+TP = 0.02
+# 最优参数
+VOLUME_MULT = 1.2
+LOOKBACK = 3
+UPPER_SHADOW_RATIO = 1.5
+
 
 
 
