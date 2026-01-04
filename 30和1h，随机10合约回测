@@ -1,0 +1,185 @@
+# -*- coding: utf-8 -*-
+"""
+Binance USDT 永续 · 多策略历史回测器（止盈 2% 版）
+- 随机 10 个合约
+- 历史 500 根 K 线
+- 1H / 30m 多策略
+- 固定止盈 2%
+- 20U × 20 杠杆
+- 输出 CSV 交易明细
+"""
+
+import requests
+import pandas as pd
+import random
+from datetime import timedelta
+
+# ================== 参数 ==================
+BASE_URL = "https://fapi.binance.com"
+TIME_OFFSET = timedelta(hours=8)
+
+SYMBOL_SAMPLE = 10
+KLINE_LIMIT = 500
+
+CAPITAL = 20
+LEVERAGE = 20
+POSITION_SIZE = CAPITAL * LEVERAGE
+
+TP_PCT = 0.02   # ⭐止盈 2%
+
+OUT_CSV = "backtest_trades_tp2.csv"
+
+# ================== 网络 ==================
+def safe_get(url, params=None, retry=3):
+    for _ in range(retry):
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            if r.status_code == 200:
+                return r.json()
+        except:
+            pass
+    return None
+
+# ================== 合约 ==================
+def get_all_usdt_symbols():
+    data = safe_get(f"{BASE_URL}/fapi/v1/exchangeInfo")
+    return [
+        s["symbol"]
+        for s in data["symbols"]
+        if s["quoteAsset"] == "USDT"
+        and s["contractType"] == "PERPETUAL"
+        and s["status"] == "TRADING"
+    ]
+
+# ================== K线 ==================
+def fetch_klines(symbol, interval, limit):
+    data = safe_get(
+        f"{BASE_URL}/fapi/v1/klines",
+        params={"symbol": symbol, "interval": interval, "limit": limit}
+    )
+    if not data:
+        return None
+
+    df = pd.DataFrame(data, columns=[
+        "open_time","open","high","low","close","volume",
+        "close_time","qav","trades","tbb","tbq","ignore"
+    ])
+
+    for c in ["open","high","low","close","volume"]:
+        df[c] = df[c].astype(float)
+
+    df["time"] = pd.to_datetime(df["open_time"], unit="ms") + TIME_OFFSET
+    return df[["time","open","high","low","close","volume"]]
+
+# ================== K线工具 ==================
+def is_bull(k): return k["close"] > k["open"]
+def is_bear(k): return k["close"] < k["open"]
+
+# ================== 策略 ==================
+def A_SHORT(df, i):
+    if i < 3: return False
+    k = df.iloc[i]
+    avg_vol = df["volume"][i-3:i].mean()
+    body = abs(k["close"] - k["open"])
+    if body == 0: return False
+    upper = k["high"] - max(k["open"], k["close"])
+    return is_bull(k) and k["volume"] >= avg_vol * 1.2 and upper / body >= 1.5
+
+def L1_SHORT(df, i):
+    if i < 1: return False
+    prev, cur = df.iloc[i-1], df.iloc[i]
+    rise = (prev["close"] - prev["open"]) / prev["open"]
+    return rise >= 0.03 and is_bull(prev) and is_bear(cur)
+
+def L2_LONG(df, i):
+    if i < 4: return False
+    seg = df.iloc[i-4:i-1]
+    cur = df.iloc[i]
+    if not all(seg["close"] < seg["open"]): return False
+    drop = (seg.iloc[0]["open"] - seg.iloc[-1]["close"]) / seg.iloc[0]["open"]
+    vol_ratio = cur["volume"] / seg["volume"].mean()
+    return drop >= 0.04 and vol_ratio <= 0.8
+
+# ================== 回测（止盈 2%） ==================
+def backtest(symbol, df, timeframe):
+    trades = []
+    pos = None
+
+    for i in range(len(df) - 1):
+        bar = df.iloc[i]
+
+        # 开仓
+        if pos is None:
+            if timeframe == "1h" and A_SHORT(df, i):
+                entry = df.iloc[i+1]
+                pos = ("SHORT", "A_SHORT", entry)
+
+            elif timeframe == "30m" and L1_SHORT(df, i):
+                entry = df.iloc[i+1]
+                pos = ("SHORT", "L1_SHORT", entry)
+
+            elif timeframe == "30m" and L2_LONG(df, i):
+                entry = df.iloc[i+1]
+                pos = ("LONG", "L2_LONG", entry)
+
+        # 持仓检查止盈
+        else:
+            direction, strategy, entry = pos
+            entry_price = entry["open"]
+
+            if direction == "LONG":
+                tp_price = entry_price * (1 + TP_PCT)
+                if bar["high"] >= tp_price:
+                    pnl = TP_PCT * POSITION_SIZE
+                else:
+                    continue
+
+            else:
+                tp_price = entry_price * (1 - TP_PCT)
+                if bar["low"] <= tp_price:
+                    pnl = TP_PCT * POSITION_SIZE
+                else:
+                    continue
+
+            trades.append({
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "strategy": strategy,
+                "direction": direction,
+                "entry_time": entry["time"],
+                "entry_price": entry_price,
+                "exit_time": bar["time"],
+                "exit_price": round(tp_price, 6),
+                "pnl_usdt": round(pnl, 2),
+                "leverage": LEVERAGE
+            })
+
+            pos = None
+
+    return trades
+
+# ================== 主程序 ==================
+def main():
+    symbols = random.sample(get_all_usdt_symbols(), SYMBOL_SAMPLE)
+    print("🎯 回测合约：", symbols)
+
+    all_trades = []
+
+    for s in symbols:
+        df1 = fetch_klines(s, "1h", KLINE_LIMIT)
+        df30 = fetch_klines(s, "30m", KLINE_LIMIT)
+
+        if df1 is not None:
+            all_trades += backtest(s, df1, "1h")
+        if df30 is not None:
+            all_trades += backtest(s, df30, "30m")
+
+    df_out = pd.DataFrame(all_trades)
+    df_out.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
+
+    print(f"\n✅ 回测完成")
+    print(f"📄 交易数：{len(df_out)}")
+    print(f"📁 CSV 文件：{OUT_CSV}")
+
+if __name__ == "__main__":
+    main()
