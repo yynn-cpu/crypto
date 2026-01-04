@@ -1,0 +1,131 @@
+# -*- coding: utf-8 -*-
+"""
+Binance USDT 永续合约
+1H 实盘扫描器（A_放量拉升失败｜做空）
+命中即输出：入场价 + 当前价
+"""
+
+import requests
+import pandas as pd
+from datetime import timedelta, datetime
+import time
+
+# ================= 参数 =================
+BASE_URL = "https://fapi.binance.com"
+INTERVAL = "1h"
+KLINE_LIMIT = 10
+
+# 策略参数（你的最优参数）
+VOLUME_MULT = 1.2
+LOOKBACK = 3
+UPPER_SHADOW_RATIO = 1.5
+
+TIME_OFFSET = timedelta(hours=8)  # 北京时间
+SLEEP = 0.15
+
+# ================= 工具函数 =================
+def get_all_usdt_symbols():
+    r = requests.get(f"{BASE_URL}/fapi/v1/exchangeInfo", timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    return [
+        s["symbol"]
+        for s in data["symbols"]
+        if s["quoteAsset"] == "USDT"
+        and s["contractType"] == "PERPETUAL"
+    ]
+
+
+def get_klines(symbol):
+    r = requests.get(
+        f"{BASE_URL}/fapi/v1/klines",
+        params={
+            "symbol": symbol,
+            "interval": INTERVAL,
+            "limit": KLINE_LIMIT
+        },
+        timeout=10
+    )
+    r.raise_for_status()
+
+    df = pd.DataFrame(r.json(), columns=[
+        "open_time","open","high","low","close","volume",
+        "close_time","qav","num_trades","tb","tq","ignore"
+    ])
+
+    for c in ["open","high","low","close","volume"]:
+        df[c] = df[c].astype(float)
+
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms") + TIME_OFFSET
+    return df
+
+
+# ================= 逻辑 A（做空） =================
+def trigger_A(df, i):
+    if i < LOOKBACK:
+        return False
+
+    k = df.iloc[i]
+
+    # 必须是阳线
+    if k["close"] <= k["open"]:
+        return False
+
+    avg_vol = df["volume"][i-LOOKBACK:i].mean()
+    body = abs(k["close"] - k["open"])
+    if body == 0:
+        return False
+
+    upper_shadow = k["high"] - max(k["open"], k["close"])
+
+    return (
+        k["volume"] >= avg_vol * VOLUME_MULT and
+        upper_shadow / body >= UPPER_SHADOW_RATIO
+    )
+
+
+# ================= 主程序 =================
+def main():
+    print("\n====== 1H 实盘扫描启动（全合约）======")
+    print("扫描时间（北京时间）：", datetime.utcnow() + TIME_OFFSET, "\n")
+
+    symbols = get_all_usdt_symbols()
+    print(f"USDT 永续合约数量: {len(symbols)}\n")
+
+    for idx, sym in enumerate(symbols, 1):
+        print(f"扫描 {idx}/{len(symbols)}: {sym}")
+
+        try:
+            df = get_klines(sym)
+
+            # 最近一根【已收盘】
+            signal_k = len(df) - 2
+            # 当前正在形成的 K 线
+            current_k = len(df) - 1
+
+            if trigger_A(df, signal_k):
+                signal_bar = df.iloc[signal_k]
+                current_bar = df.iloc[current_k]
+
+                entry_price = current_bar["open"]   # 下一根开盘
+                current_price = current_bar["close"]
+
+                print(
+                    f"\n🚨【做空信号命中】{sym}\n"
+                    f"  信号K线时间 : {signal_bar['open_time']}\n"
+                    f"  放量上影失败\n"
+                    f"  👉 建议入场价 : {entry_price}\n"
+                    f"  📈 当前价格   : {current_price}\n"
+                    f"  （下一根 1H 开盘做空）\n"
+                )
+
+            time.sleep(SLEEP)
+
+        except Exception as e:
+            print(f"❌ {sym} 获取失败: {e}")
+
+    print("\n====== 扫描结束 ======")
+
+
+if __name__ == "__main__":
+    main()
