@@ -1,0 +1,140 @@
+# -*- coding: utf-8 -*-
+"""
+Binance USDT 永续 · 全市场实盘扫描器（可见进度版）
+30m 周期｜只扫描不下单
+"""
+
+import requests
+import pandas as pd
+import time
+from datetime import datetime, timezone
+
+BASE_URL = "https://fapi.binance.com"
+INTERVAL = "30m"
+KLINE_LIMIT = 10
+SLEEP = 60  # 每分钟一轮
+
+# ================== 网络 ==================
+def safe_get(url, params=None, retry=3):
+    for _ in range(retry):
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            if r.status_code == 200:
+                return r.json()
+        except:
+            time.sleep(1)
+    return None
+
+# ================== 合约 ==================
+def get_all_symbols():
+    data = safe_get(f"{BASE_URL}/fapi/v1/exchangeInfo")
+    return [
+        s['symbol'] for s in data['symbols']
+        if s['quoteAsset'] == 'USDT'
+        and s['status'] == 'TRADING'
+        and s['contractType'] == 'PERPETUAL'
+    ]
+
+# ================== K线 ==================
+def fetch_klines(symbol):
+    data = safe_get(
+        f"{BASE_URL}/fapi/v1/klines",
+        params={
+            "symbol": symbol,
+            "interval": INTERVAL,
+            "limit": KLINE_LIMIT
+        }
+    )
+    if not data:
+        return None
+
+    df = pd.DataFrame(data, columns=[
+        "open_time","open","high","low","close","volume",
+        "close_time","qav","trades","tbb","tbq","ignore"
+    ])
+
+    df['time'] = (
+        pd.to_datetime(df['open_time'], unit='ms', utc=True)
+        .dt.tz_convert('Asia/Shanghai')
+        .dt.tz_localize(None)
+    )
+
+    for c in ['open','high','low','close','volume']:
+        df[c] = df[c].astype(float)
+
+    return df[['time','open','high','low','close','volume']]
+
+# ================== K线工具 ==================
+def is_bull(k): return k['close'] > k['open']
+def is_bear(k): return k['close'] < k['open']
+
+# ================== L1 SHORT ==================
+def L1_SHORT(df):
+    prev = df.iloc[-2]
+    cur  = df.iloc[-1]
+    rise = (prev['close'] - prev['open']) / prev['open']
+    return rise >= 0.03 and is_bull(prev) and is_bear(cur)
+
+# ================== L2 LONG ==================
+def L2_LONG(df):
+    seg = df.iloc[-4:-1]
+    cur = df.iloc[-1]
+
+    if not all(seg['close'] < seg['open']):
+        return False
+
+    drop = (seg.iloc[0]['open'] - seg.iloc[-1]['close']) / seg.iloc[0]['open']
+    vol_ratio = cur['volume'] / seg['volume'].mean()
+
+    return drop >= 0.04 and vol_ratio <= 0.8
+
+# ================== 扫描 ==================
+def scan():
+    symbols = get_all_symbols()
+    start = time.time()
+
+    print("\n" + "="*100)
+    print(f"🕒 扫描开始（北京时间）：{datetime.now()}")
+    print(f"📊 合约总数：{len(symbols)}")
+
+    for i, s in enumerate(symbols, 1):
+        df = fetch_klines(s)
+
+        print("\n" + "-"*80)
+        print(f"[{i}/{len(symbols)}] 扫描 {s}")
+
+        if df is None or len(df) < 5:
+            print("⚠️ K线不足 / 拉取失败")
+            print("👉 现在该干嘛：跳过")
+            continue
+
+        hit = False
+
+        if L1_SHORT(df):
+            hit = True
+            print("🚨 命中 L1 SHORT（诱多回落）")
+            print("👉 现在该干嘛：下一根 30m 开盘【做空】")
+
+        if L2_LONG(df):
+            hit = True
+            print("🟢 命中 L2 LONG（恐慌衰竭反弹）")
+            print("👉 现在该干嘛：下一根 30m 开盘【做多】")
+
+        if not hit:
+            print("❌ 未命中任何策略")
+            print("👉 现在该干嘛：忽略该合约，继续扫描")
+
+    cost = time.time() - start
+    print("\n" + "="*100)
+    print(f"✅ 本轮扫描完成，用时 {cost:.1f} 秒")
+
+
+# ================== 主循环 ==================
+def main():
+    print("🚀 Binance 全市场 30m 实盘扫描器启动")
+    while True:
+        scan()
+        time.sleep(SLEEP)
+
+if __name__ == "__main__":
+    main()
