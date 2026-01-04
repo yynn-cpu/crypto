@@ -1,131 +1,119 @@
 # -*- coding: utf-8 -*-
 """
 Binance USDT 永续合约
-1H 实盘扫描器（A_放量拉升失败｜做空）
-命中即输出：入场价 + 当前价
+30m K线采集（随机30个合约｜最近500根）
 """
 
 import requests
 import pandas as pd
-from datetime import timedelta, datetime
 import time
+import random
+from datetime import datetime
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# ================= 参数 =================
 BASE_URL = "https://fapi.binance.com"
-INTERVAL = "1h"
-KLINE_LIMIT = 10
 
-# 策略参数（你的最优参数）
-VOLUME_MULT = 1.2
-LOOKBACK = 3
-UPPER_SHADOW_RATIO = 1.5
-
-TIME_OFFSET = timedelta(hours=8)  # 北京时间
+# ========= 参数 =========
+INTERVAL = "30m"
+LIMIT = 500
 SLEEP = 0.15
+TIMEOUT = 20
+RETRIES = 5
+RANDOM_SYMBOLS = 30
 
-# ================= 工具函数 =================
-def get_all_usdt_symbols():
-    r = requests.get(f"{BASE_URL}/fapi/v1/exchangeInfo", timeout=10)
-    r.raise_for_status()
+OUT_FILE = f"usdt_perp_30m_random30_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+
+# ================= 稳定 Session =================
+def create_session():
+    session = requests.Session()
+    retry = Retry(
+        total=RETRIES,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    return session
+
+session = create_session()
+
+# ================= 获取所有 USDT 永续 =================
+def get_all_usdt_perp_symbols():
+    r = session.get(f"{BASE_URL}/fapi/v1/exchangeInfo", timeout=TIMEOUT)
     data = r.json()
-    return [
+
+    symbols = [
         s["symbol"]
-        for s in data["symbols"]
-        if s["quoteAsset"] == "USDT"
-        and s["contractType"] == "PERPETUAL"
+        for s in data.get("symbols", [])
+        if s.get("quoteAsset") == "USDT"
+        and s.get("contractType") == "PERPETUAL"
     ]
 
+    return sorted(list(set(symbols)))
 
-def get_klines(symbol):
-    r = requests.get(
-        f"{BASE_URL}/fapi/v1/klines",
-        params={
-            "symbol": symbol,
-            "interval": INTERVAL,
-            "limit": KLINE_LIMIT
-        },
-        timeout=10
-    )
-    r.raise_for_status()
+# ================= 拉取最近 500 根 30m =================
+def fetch_latest_klines(symbol):
+    params = {
+        "symbol": symbol,
+        "interval": INTERVAL,
+        "limit": LIMIT
+    }
 
-    df = pd.DataFrame(r.json(), columns=[
-        "open_time","open","high","low","close","volume",
-        "close_time","qav","num_trades","tb","tq","ignore"
+    r = session.get(f"{BASE_URL}/fapi/v1/klines", params=params, timeout=TIMEOUT)
+    data = r.json()
+
+    if not isinstance(data, list) or len(data) == 0:
+        return None
+
+    df = pd.DataFrame(data, columns=[
+        "time","open","high","low","close","volume",
+        "_","_","_","_","_","_"
     ])
 
-    for c in ["open","high","low","close","volume"]:
-        df[c] = df[c].astype(float)
+    df = df[["time","open","high","low","close","volume"]].astype(float)
+    df["date"] = pd.to_datetime(df["time"], unit="ms")
+    df["symbol"] = symbol
 
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms") + TIME_OFFSET
-    return df
+    return df[["symbol","date","open","high","low","close","volume"]]
 
+# ================= 主流程 =================
+all_symbols = get_all_usdt_perp_symbols()
+total_all = len(all_symbols)
 
-# ================= 逻辑 A（做空） =================
-def trigger_A(df, i):
-    if i < LOOKBACK:
-        return False
+symbols = random.sample(all_symbols, min(RANDOM_SYMBOLS, total_all))
 
-    k = df.iloc[i]
+print(f"🎯 随机抽取 {len(symbols)} / {total_all} 个 USDT 永续合约")
+print(f"⏱ K线周期：{INTERVAL} ｜ 最近 {LIMIT} 根\n")
 
-    # 必须是阳线
-    if k["close"] <= k["open"]:
-        return False
+all_data = []
+success = fail = 0
 
-    avg_vol = df["volume"][i-LOOKBACK:i].mean()
-    body = abs(k["close"] - k["open"])
-    if body == 0:
-        return False
+for idx, symbol in enumerate(symbols, 1):
+    try:
+        print(f"[{idx}/{len(symbols)}] 抓取 {symbol}")
+        df = fetch_latest_klines(symbol)
 
-    upper_shadow = k["high"] - max(k["open"], k["close"])
+        if df is None or df.empty:
+            raise Exception("无K线数据")
 
-    return (
-        k["volume"] >= avg_vol * VOLUME_MULT and
-        upper_shadow / body >= UPPER_SHADOW_RATIO
-    )
+        all_data.append(df)
+        success += 1
 
+    except Exception as e:
+        print(f"    ⚠️ {symbol} 失败：{e}")
+        fail += 1
 
-# ================= 主程序 =================
-def main():
-    print("\n====== 1H 实盘扫描启动（全合约）======")
-    print("扫描时间（北京时间）：", datetime.utcnow() + TIME_OFFSET, "\n")
+    time.sleep(SLEEP)
 
-    symbols = get_all_usdt_symbols()
-    print(f"USDT 永续合约数量: {len(symbols)}\n")
+# ================= 保存 =================
+final_df = pd.concat(all_data, ignore_index=True)
+final_df.sort_values(["symbol", "date"], inplace=True)
+final_df.to_csv(OUT_FILE, index=False, encoding="utf-8-sig")
 
-    for idx, sym in enumerate(symbols, 1):
-        print(f"扫描 {idx}/{len(symbols)}: {sym}")
-
-        try:
-            df = get_klines(sym)
-
-            # 最近一根【已收盘】
-            signal_k = len(df) - 2
-            # 当前正在形成的 K 线
-            current_k = len(df) - 1
-
-            if trigger_A(df, signal_k):
-                signal_bar = df.iloc[signal_k]
-                current_bar = df.iloc[current_k]
-
-                entry_price = current_bar["open"]   # 下一根开盘
-                current_price = current_bar["close"]
-
-                print(
-                    f"\n🚨【做空信号命中】{sym}\n"
-                    f"  信号K线时间 : {signal_bar['open_time']}\n"
-                    f"  放量上影失败\n"
-                    f"  👉 建议入场价 : {entry_price}\n"
-                    f"  📈 当前价格   : {current_price}\n"
-                    f"  （下一根 1H 开盘做空）\n"
-                )
-
-            time.sleep(SLEEP)
-
-        except Exception as e:
-            print(f"❌ {sym} 获取失败: {e}")
-
-    print("\n====== 扫描结束 ======")
-
-
-if __name__ == "__main__":
-    main()
+print("\n==================== 完成 ====================")
+print(f"✅ 成功：{success}")
+print(f"⚠️ 失败：{fail}")
+print(f"📊 总K线：{len(final_df)}")
+print(f"📁 文件：{OUT_FILE}")
