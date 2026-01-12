@@ -1,0 +1,143 @@
+# -*- coding: utf-8 -*-
+"""
+📊 本地 CSV 多阈值 BIG_GREEN_THEN_RED_SHORT 回测
+【严格版】
+- i-1：大阳
+- i  ：收阴（确认）
+- i+1：开盘做空
+- 同一合约同一时间只允许一笔持仓
+- 固定 2% 止盈
+- 完全无未来函数
+"""
+
+import pandas as pd
+from tqdm import tqdm
+
+# ================= 参数 =================
+CSV_FILE = r"C:\Users\1\all_usdt_perp_1d_20251225_2256.csv"
+OUTPUT_CSV = r"C:\Users\1\Desktop\big_green_red_backtest_tp2_SINGLE_POSITION.csv"
+
+INVEST = 20
+LEVERAGE = 20
+TP = 0.02
+THRESHOLDS = [1.05, 1.12]
+
+# ================= 读取数据 =================
+df = pd.read_csv(CSV_FILE)
+df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
+df["date"] = pd.to_datetime(df["date"])
+df = df.sort_values(["symbol", "date"]).reset_index(drop=True)
+
+# ================= 工具函数 =================
+def is_big_green(c, ratio):
+    return c["close"] > c["open"] * ratio
+
+def is_red(c):
+    return c["close"] < c["open"]
+
+# ================= 回测函数（单合约｜单仓） =================
+def backtest_symbol(df_s, ratio):
+    trades = []
+    n = len(df_s)
+    i = 1  # 从第二根K开始
+
+    while i < n - 1:
+        prev = df_s.iloc[i - 1]
+        curr = df_s.iloc[i]
+
+        # ---------- 信号未满足 ----------
+        if not (is_big_green(prev, ratio) and is_red(curr)):
+            i += 1
+            continue
+
+        # ---------- 开仓（i+1 开盘） ----------
+        entry_idx = i + 1
+        entry = df_s.iloc[entry_idx]
+        entry_price = entry["open"]
+        entry_date = entry["date"]
+        tp_price = entry_price * (1 - TP)
+
+        max_drawdown = 0.0
+        exit_price = entry_price
+        exit_date = entry_date
+        exit_idx = entry_idx
+
+        # ---------- 持仓阶段（锁仓） ----------
+        for j in range(entry_idx, n):
+            k = df_s.iloc[j]
+
+            # 空单浮亏（看最高价）
+            dd = (k["high"] - entry_price) / entry_price * INVEST * LEVERAGE
+            max_drawdown = max(max_drawdown, dd)
+
+            # 止盈
+            if k["low"] <= tp_price:
+                exit_price = tp_price
+                exit_date = k["date"]
+                exit_idx = j
+                break
+        else:
+            # 未止盈，最后一根K强制平仓
+            last = df_s.iloc[-1]
+            exit_price = last["close"]
+            exit_date = last["date"]
+            exit_idx = last.name
+
+        held_days = exit_idx - entry_idx + 1
+        profit = (entry_price - exit_price) / entry_price * INVEST * LEVERAGE
+
+        trades.append({
+            "symbol": df_s.iloc[0]["symbol"],
+            "threshold": round(ratio, 2),
+            "entry_date": entry_date,
+            "entry_price": round(entry_price, 6),
+            "exit_date": exit_date,
+            "exit_price": round(exit_price, 6),
+            "held_days": held_days,
+            "profit": round(profit, 2),
+            "max_drawdown": round(max_drawdown, 2)
+        })
+
+        # ⭐⭐⭐ 核心：跳过整个持仓区间 ⭐⭐⭐
+        i = exit_idx + 1
+
+    return trades
+
+# ================= 主程序 =================
+symbols = df["symbol"].unique()
+all_trades = []
+
+for ratio in THRESHOLDS:
+    print("\n" + "=" * 80)
+    print(f"📊 回测阈值 {ratio:.2f}")
+
+    ratio_trades = []
+
+    for sym in tqdm(symbols, desc=f"回测中 {ratio:.2f}"):
+        df_s = df[df["symbol"] == sym].reset_index(drop=True)
+        ratio_trades.extend(backtest_symbol(df_s, ratio))
+
+    if ratio_trades:
+        out = pd.DataFrame(ratio_trades)
+        all_trades.append(out)
+
+        total = len(out)
+        wins = (out["profit"] > 0).sum()
+        winrate = wins / total * 100
+        max_hold = out["held_days"].max()
+        max_dd = out["max_drawdown"].max()
+        total_profit = out["profit"].sum()
+
+        print(f"触发次数: {total}")
+        print(f"胜率: {winrate:.2f}%")
+        print(f"最长持仓: {max_hold} 天")
+        print(f"最大浮亏: {max_dd:.2f} USDT")
+        print(f"累计收益: {total_profit:.2f} USDT")
+    else:
+        print("⚠ 无触发")
+
+# ================= 输出 CSV =================
+if all_trades:
+    final_df = pd.concat(all_trades, ignore_index=True)
+    final_df.to_csv(OUTPUT_CSV, index=False)
+    print(f"\n✅ 已输出【单合约单仓】回测结果：\n{OUTPUT_CSV}")
