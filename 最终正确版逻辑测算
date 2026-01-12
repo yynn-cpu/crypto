@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-📊 Registry 回测系统 · 4 条独立逻辑
+📊 Registry 扩展版回测系统
+- 逻辑 A 多阈值
+- 新增逻辑 D: 连续2天上涨，第3天下跌，第4天开盘做空
+- 新增逻辑 E: 连续3天上涨，第4天下跌，第5天开盘做空
 - 无未来函数
 - 单合约单仓
 - 输出逐笔交易 + 策略汇总
-- 统计实现 2% 止盈的概率（胜率）
 """
 
 import pandas as pd
@@ -12,20 +14,31 @@ from tqdm import tqdm
 
 # ================= 参数 =================
 CSV_FILE = r"C:\Users\1\all_usdt_perp_1d_20251225_2256.csv"
-TRADES_CSV = r"C:\Users\1\Desktop\registry_trade_details_FINAL.csv"
-SUMMARY_CSV = r"C:\Users\1\Desktop\registry_strategy_summary_FINAL.csv"
+TRADES_CSV = r"C:\Users\1\Desktop\registry_trade_details_EXTENDED.csv"
+SUMMARY_CSV = r"C:\Users\1\Desktop\registry_strategy_summary_EXTENDED.csv"
 
 INVEST = 20
 LEVERAGE = 20
 TP = 0.02  # 固定止盈 2%
 
 # ================= 策略注册表 =================
-STRATEGIES = [
-    {"name": "BIG_GREEN_RED_105", "type": "A", "ratio": 1.05},
-    {"name": "BIG_GREEN_RED_112", "type": "A", "ratio": 1.12},
-    {"name": "THREE_RED", "type": "B"},
-    {"name": "ONE_UP_THREE_DOWN", "type": "C"}
-]
+STRATEGIES = []
+
+# 逻辑 A 多阈值
+for ratio in [1.03, 1.06, 1.08, 1.10]:
+    STRATEGIES.append({"name": f"BIG_GREEN_RED_{int((ratio-1)*100)}", "type": "A", "ratio": ratio})
+
+# 逻辑 B: 连续 3 阴
+STRATEGIES.append({"name": "THREE_RED", "type": "B"})
+
+# 逻辑 C: 1 阳 + 3 阴
+STRATEGIES.append({"name": "ONE_UP_THREE_DOWN", "type": "C"})
+
+# 逻辑 D: 连续2天上涨，第3天阴，第4天开盘
+STRATEGIES.append({"name": "TWO_UP_ONE_DOWN", "type": "D"})
+
+# 逻辑 E: 连续3天上涨，第4天阴，第5天开盘
+STRATEGIES.append({"name": "THREE_UP_ONE_DOWN", "type": "E"})
 
 # ================= 数据读取 =================
 df = pd.read_csv(CSV_FILE)
@@ -35,38 +48,59 @@ df = df.sort_values(["symbol", "date"]).reset_index(drop=True)
 
 # ================= 工具函数 =================
 def is_red(c): return c["close"] < c["open"]
+def is_green(c): return c["close"] > c["open"]
 def is_big_green(c, ratio): return c["close"] > c["open"] * ratio
 
 def three_red(df_s, i):
     return is_red(df_s.iloc[i]) and is_red(df_s.iloc[i-1]) and is_red(df_s.iloc[i-2])
 
 def one_up_three_down(df_s, i):
-    # i-3: 阳线, i-2, i-1, i: 阴线
-    return (df_s.iloc[i-3]["close"] > df_s.iloc[i-3]["open"] and
-            is_red(df_s.iloc[i-2]) and is_red(df_s.iloc[i-1]) and is_red(df_s.iloc[i]))
+    return (is_green(df_s.iloc[i-3]) and
+            is_red(df_s.iloc[i-2]) and
+            is_red(df_s.iloc[i-1]) and
+            is_red(df_s.iloc[i]))
+
+def two_up_one_down(df_s, i):
+    # i-2, i-1: 涨，i: 收阴
+    return is_green(df_s.iloc[i-2]) and is_green(df_s.iloc[i-1]) and is_red(df_s.iloc[i])
+
+def three_up_one_down(df_s, i):
+    # i-3, i-2, i-1: 涨，i: 收阴
+    return is_green(df_s.iloc[i-3]) and is_green(df_s.iloc[i-2]) and is_green(df_s.iloc[i-1]) and is_red(df_s.iloc[i])
 
 # ================= 单策略单合约回测 =================
 def backtest_symbol_strategy(df_s, strategy):
     trades = []
     n = len(df_s)
-    i = 3 if strategy["type"] == "C" else 2  # C逻辑需要i-3
+    # 逻辑 D/E需要更多历史K线
+    i = 4 if strategy["type"] == "E" else 3 if strategy["type"] == "C" else 2 if strategy["type"] == "D" else 2
 
     while i < n - 1:
         signal = False
 
         if strategy["type"] == "A":
-            signal = is_big_green(df_s.iloc[i - 1], strategy["ratio"]) and is_red(df_s.iloc[i])
+            signal = is_big_green(df_s.iloc[i-1], strategy["ratio"]) and is_red(df_s.iloc[i])
         elif strategy["type"] == "B":
             signal = three_red(df_s, i)
         elif strategy["type"] == "C":
             signal = one_up_three_down(df_s, i)
+        elif strategy["type"] == "D":
+            signal = two_up_one_down(df_s, i)
+        elif strategy["type"] == "E":
+            signal = three_up_one_down(df_s, i)
 
         if not signal:
             i += 1
             continue
 
-        # ---------- 入场（i+1 开盘） ----------
-        entry_idx = i + 1
+        # ---------- 入场 ----------
+        # D: 第4天开盘，E: 第5天开盘，其他均 i+1
+        entry_offset = {"A":1, "B":1, "C":1, "D":1, "E":1}[strategy["type"]]
+        if strategy["type"] == "D":
+            entry_offset = 1  # i+1 = 第4天
+        elif strategy["type"] == "E":
+            entry_offset = 1  # i+1 = 第5天
+        entry_idx = i + entry_offset
         entry_k = df_s.iloc[entry_idx]
         entry_price = entry_k["open"]
         entry_date = entry_k["date"]
@@ -80,11 +114,8 @@ def backtest_symbol_strategy(df_s, strategy):
         # ---------- 持仓阶段 ----------
         for j in range(entry_idx, n):
             k = df_s.iloc[j]
-
-            dd = (k["high"] - entry_price) / entry_price * INVEST * LEVERAGE
+            dd = (k["high"] - entry_price)/entry_price*INVEST*LEVERAGE
             max_dd = max(max_dd, dd)
-
-            # 止盈判断
             if k["low"] <= tp_price:
                 exit_idx = j
                 exit_price = tp_price
@@ -97,7 +128,7 @@ def backtest_symbol_strategy(df_s, strategy):
             exit_date = last["date"]
 
         held_days = exit_idx - entry_idx + 1
-        profit = (entry_price - exit_price) / entry_price * INVEST * LEVERAGE
+        profit = (entry_price - exit_price)/entry_price*INVEST*LEVERAGE
 
         trades.append({
             "strategy": strategy["name"],
@@ -111,22 +142,22 @@ def backtest_symbol_strategy(df_s, strategy):
             "max_drawdown": round(max_dd,2)
         })
 
-        # ---------- 单合约单仓 ----------
+        # 单合约单仓
         i = exit_idx + 1
 
     return trades
 
-# ================= 主回测流程 =================
+# ================= 主回测 =================
 all_trades = []
 
 for strategy in STRATEGIES:
-    print("\n" + "=" * 80)
+    print("\n" + "="*80)
     print(f"📊 回测策略：{strategy['name']}")
 
     strategy_trades = []
 
     for sym in tqdm(df["symbol"].unique(), desc=strategy["name"]):
-        df_s = df[df["symbol"] == sym].reset_index(drop=True)
+        df_s = df[df["symbol"]==sym].reset_index(drop=True)
         strategy_trades.extend(backtest_symbol_strategy(df_s, strategy))
 
     if strategy_trades:
@@ -134,14 +165,14 @@ for strategy in STRATEGIES:
         all_trades.append(out)
 
         total = len(out)
-        wins = (out["profit"] > 0).sum()
-        winrate = wins / total * 100
+        wins = (out["profit"]>0).sum()
+        winrate = wins/total*100
         total_profit = out["profit"].sum()
         max_dd = out["max_drawdown"].max()
         avg_hold = out["held_days"].mean()
 
         print(f"交易次数: {total}")
-        print(f"胜率（达到 2% 收益概率）: {winrate:.2f}%")
+        print(f"胜率（2%收益概率）: {winrate:.2f}%")
         print(f"累计收益: {total_profit:.2f} USDT")
         print(f"最大浮亏: {max_dd:.2f} USDT")
         print(f"平均持仓: {avg_hold:.2f} 天")
@@ -152,14 +183,14 @@ if all_trades:
     trades_df.to_csv(TRADES_CSV, index=False)
 
     summary_df = trades_df.groupby("strategy").agg(
-        trades=("profit", "count"),
-        winrate=("profit", lambda x: (x > 0).mean() * 100),
-        total_profit=("profit", "sum"),
-        max_drawdown=("max_drawdown", "max"),
-        avg_hold=("held_days", "mean")
+        trades=("profit","count"),
+        winrate=("profit", lambda x:(x>0).mean()*100),
+        total_profit=("profit","sum"),
+        max_drawdown=("max_drawdown","max"),
+        avg_hold=("held_days","mean")
     ).reset_index()
 
-    summary_df.to_csv(SUMMARY_CSV, index=False)
+    summary_df.to_csv(SUMMARY_CSV,index=False)
 
     print("\n✅ 回测完成")
     print(f"逐笔交易: {TRADES_CSV}")
