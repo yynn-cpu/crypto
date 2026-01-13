@@ -1,0 +1,156 @@
+# -*- coding: utf-8 -*-
+"""
+📊 本地 CSV 回测 · 扛单风格优化（无未来函数）
+- 保留好的逻辑 + 新设计 5 条逻辑
+- NEW3 和 NEW5 已改写为安全版
+- 输出 CSV 包含入场/离场价格、交易详情
+- 控制台输出扛单统计指标
+"""
+
+import pandas as pd
+from tqdm import tqdm
+
+# ================= 参数 =================
+CSV_FILE = r"C:\Users\1\all_usdt_perp_1d_20251225_2256.csv"
+OUT_TRADES = r"C:\Users\1\OPTIMIZED_SHORT_STRATEGIES_SAFE_trades.csv"
+
+INVEST = 20
+LEVERAGE = 20
+TP = 0.02  # 止盈 2%
+
+# ================= 数据加载 =================
+df = pd.read_csv(CSV_FILE)
+for col in ["open", "high", "low", "close", "volume"]:
+    df[col] = df[col].astype(float)
+df["date"] = pd.to_datetime(df["date"])
+df = df.sort_values(["symbol", "date"]).reset_index(drop=True)
+print("✅ 数据加载完成")
+print(f"合约数量：{df['symbol'].nunique()}")
+
+# ================= 策略函数 =================
+
+# 原有无未来函数策略
+def BIG_GREEN_RED_5(df, i):
+    d2, d1 = df.iloc[i-2], df.iloc[i-1]
+    return d2["close"] >= d2["open"] * 1.05 and d1["close"] < d1["open"]
+
+def L3_BIG_GREEN_HAMMER(df, i):
+    d1 = df.iloc[i-1]
+    upper_shadow = d1["high"] - max(d1["open"], d1["close"])
+    candle_body = abs(d1["close"] - d1["open"])
+    return (d1["close"] >= d1["open"] * 1.05) and (upper_shadow / candle_body >= 0.3)
+
+def L1_TWO_BIG_GREEN_ONE_RED(df, i):
+    d3, d2, d1 = df.iloc[i-3], df.iloc[i-2], df.iloc[i-1]
+    return d3["close"] >= d3["open"] * 1.05 and d2["close"] >= d2["open"] * 1.05 and d1["close"] < d1["open"]
+
+# 改写后的安全策略（无未来函数）
+def NEW1_LONG_SHADOW_REVERSE(df, i):
+    d2, d1 = df.iloc[i-2], df.iloc[i-1]
+    return d1["close"] >= d1["open"] * 1.05 and d2["open"] < d1["close"]
+
+def NEW2_TWO_DAY_GREEN_DROP(df, i):
+    d4, d3, d2, d1 = df.iloc[i-4], df.iloc[i-3], df.iloc[i-2], df.iloc[i-1]
+    return d3["close"] >= d3["open"] and d2["close"] >= d2["open"] and d1["open"] < d2["close"]
+
+# NEW3 安全版：用前一天对比前两天
+def NEW3_HIGH_LOW_REVERSAL_SAFE(df, i):
+    d2, d1 = df.iloc[i-2], df.iloc[i-1]
+    return d1["high"] > d2["high"] and d1["close"] < d2["close"]
+
+# NEW4 原逻辑无未来函数
+def NEW4_VOLUME_SPIKE_FAIL(df, i):
+    d2, d1 = df.iloc[i-2], df.iloc[i-1]
+    return d2["close"] >= d2["open"] and d1["volume"] > 1.5*d2["volume"] and d1["open"] < d2["close"]
+
+# NEW5 安全版：用前一天缩小实体 + 前两天大阳
+def NEW5_SMALL_BODY_REVERSE_SAFE(df, i):
+    d2, d1 = df.iloc[i-2], df.iloc[i-1]
+    return d2["close"] >= d2["open"]*1.05 and abs(d1["close"]-d1["open"]) < (d1["high"]-d1["low"])*0.3 and d1["close"] < d1["open"]
+
+# ================= 策略列表 =================
+STRATEGIES = [
+    ("BIG_GREEN_RED_5%", "SHORT", BIG_GREEN_RED_5),
+    ("L3_BIG_GREEN_HAMMER", "SHORT", L3_BIG_GREEN_HAMMER),
+    ("L1_TWO_BIG_GREEN_ONE_RED", "SHORT", L1_TWO_BIG_GREEN_ONE_RED),
+    ("NEW1_LONG_SHADOW_REVERSE", "SHORT", NEW1_LONG_SHADOW_REVERSE),
+    ("NEW2_TWO_DAY_GREEN_DROP", "SHORT", NEW2_TWO_DAY_GREEN_DROP),
+    ("NEW3_HIGH_LOW_REVERSAL_SAFE", "SHORT", NEW3_HIGH_LOW_REVERSAL_SAFE),
+    ("NEW4_VOLUME_SPIKE_FAIL", "SHORT", NEW4_VOLUME_SPIKE_FAIL),
+    ("NEW5_SMALL_BODY_REVERSE_SAFE", "SHORT", NEW5_SMALL_BODY_REVERSE_SAFE)
+]
+
+# ================= 回测 =================
+trades = []
+
+for sym in tqdm(df["symbol"].unique(), desc="回测中"):
+    sdf = df[df["symbol"] == sym].reset_index(drop=True)
+    n = len(sdf)
+
+    for i in range(4, n-1):
+        entry = sdf.iloc[i]
+
+        for name, direction, func in STRATEGIES:
+            if not func(sdf, i):
+                continue
+
+            entry_price = entry["open"]
+            tp_price = entry_price * (1 - TP)  # 做空止盈
+
+            max_dd = 0.0
+            exit_price = None
+            exit_idx = None
+
+            for j in range(i, n):
+                k = sdf.iloc[j]
+                dd = (k["high"] - entry_price) / entry_price * INVEST * LEVERAGE
+                max_dd = max(max_dd, dd)
+
+                # 止盈判断
+                if k["low"] <= tp_price:
+                    exit_price = tp_price
+                    exit_idx = j
+                    break
+
+            if exit_price is None:
+                exit_price = sdf.iloc[-1]["close"]
+                exit_idx = n - 1
+
+            profit = (entry_price - exit_price) / entry_price * INVEST * LEVERAGE
+
+            trades.append({
+                "strategy": name,
+                "direction": direction,
+                "symbol": sym,
+                "entry_date": entry["date"],
+                "exit_date": sdf.iloc[exit_idx]["date"],
+                "entry_price": round(entry_price,6),
+                "exit_price": round(exit_price,6),
+                "profit_usdt": round(profit,4),
+                "max_drawdown_usdt": round(max_dd,4),
+                "hold_days": exit_idx - i + 1
+            })
+
+# ================= 输出 =================
+tdf = pd.DataFrame(trades)
+tdf.to_csv(OUT_TRADES, index=False, encoding="utf-8-sig")
+
+print("\n" + "=" * 80)
+print("📊 扛单视角 · 策略统计")
+
+for name in tdf["strategy"].unique():
+    sdf = tdf[tdf["strategy"] == name]
+    total_profit = sdf["profit_usdt"].sum()
+    max_dd = sdf["max_drawdown_usdt"].max()
+    ratio = total_profit / max_dd if max_dd > 0 else float("inf")
+
+    print("\n" + "-"*60)
+    print(f"策略：{name}")
+    print(f"方向：{sdf.iloc[0]['direction']}")
+    print(f"交易次数：{len(sdf)}")
+    print(f"历史总获利：{total_profit:.2f} USDT")
+    print(f"最大单笔回撤：{max_dd:.2f} USDT")
+    print(f"获利 / 最大回撤 比：{ratio:.2f}")
+    print(f"平均持仓天数：{sdf['hold_days'].mean():.2f} 天")
+
+print("\n📁 逐笔交易 CSV 输出：", OUT_TRADES)
