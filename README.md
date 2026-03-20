@@ -1,1 +1,2 @@
-通过py采集的完整币安日K线数据，之后用来进行数据分析
+Binance Daily K-Line Data & Analysis Station
+This project focuses on the automated collection of full historical daily K-line data from Binance and daily quantitative analysis to improve trading strategies and programmatic execution.
